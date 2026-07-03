@@ -1,0 +1,1189 @@
+/**
+ * LINE WORKS インタビュー予約Bot (GAS)
+ * PRIVATE_KEY修復・キャッシュ機能追加版 (個別トーク専用 / 2段階Flexメッセージ版 / 確認ステップ追加 / コメント転載機能追加)
+ */
+
+const props = PropertiesService.getScriptProperties().getProperties();
+
+const CONFIG = {
+  CLIENT_ID: props.CLIENT_ID || "",
+  CLIENT_SECRET: props.CLIENT_SECRET || "",
+  SERVICE_ACCOUNT: props.SERVICE_ACCOUNT || "",
+  PRIVATE_KEY: props.PRIVATE_KEY || "",
+  BOT_ID: props.BOT_ID || "",
+  SPREADSHEET_ID: props.SPREADSHEET_ID || "",
+  CALENDAR_ID: props.CALENDAR_ID || "" // 【追加】GoogleカレンダーID
+};
+
+// ==========================================
+// 1. スプレッドシート取得ヘルパー
+// ==========================================
+function getTargetSpreadsheet() {
+  if (CONFIG.SPREADSHEET_ID) {
+    return SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  }
+  return SpreadsheetApp.getActiveSpreadsheet();
+}
+
+// ==========================================
+// 2. 予約枠生成機能
+// ==========================================
+function generateReservationSlots() {
+  const ss = getTargetSpreadsheet();
+  
+  const settingSheet = ss.getSheetByName("設定");
+  const reservationSheet = ss.getSheetByName("予約枠");
+  
+  if (!settingSheet || !reservationSheet) {
+    console.error("エラー：「設定」シートまたは「予約枠」シートが見つかりません。");
+    return;
+  }
+  
+  const startDateVal = settingSheet.getRange("B1").getValue();
+  const endDateVal = settingSheet.getRange("B2").getValue();
+  
+  if (!startDateVal || !endDateVal) {
+    console.error("エラー：B1セルの開始日、またはB2セルの終了日が設定されていません。");
+    return;
+  }
+  
+  const lastRow = settingSheet.getLastRow();
+  let timeSlots = [];
+  if (lastRow >= 5) {
+    const timeValues = settingSheet.getRange(5, 1, lastRow - 4, 1).getValues();
+    timeSlots = timeValues.flat().filter(String);
+  }
+  
+  if (timeSlots.length === 0) {
+    console.error("エラー：開始時間が設定されていません。A5セル以降に入力してください。");
+    return;
+  }
+  
+  const startDate = new Date(startDateVal);
+  const endDate = new Date(endDateVal);
+  
+  const headers = ["ID", "日付", "開始", "終了", "状態", "医師", "LINEID", "コメント", "備考"];
+  const outputData = [headers];
+  
+  let currentDate = new Date(startDate.getTime());
+  let idCounter = 1;
+  
+  while (currentDate <= endDate) {
+    const dateString = Utilities.formatDate(currentDate, "Asia/Tokyo", "yyyy/MM/dd");
+    
+    for (let i = 0; i < timeSlots.length; i++) {
+      let startTimeString = "";
+      let endTimeString = "";
+      
+      if (timeSlots[i] instanceof Date) {
+        startTimeString = Utilities.formatDate(timeSlots[i], "Asia/Tokyo", "HH:mm");
+        const endTimeObj = new Date(timeSlots[i].getTime() + (60 * 60 * 1000));
+        endTimeString = Utilities.formatDate(endTimeObj, "Asia/Tokyo", "HH:mm");
+      } else {
+        startTimeString = timeSlots[i];
+        endTimeString = "";
+      }
+      
+      const rowData = [
+        idCounter,
+        dateString,
+        startTimeString,
+        endTimeString,
+        "空き",
+        "",
+        "",
+        "",
+        ""
+      ];
+      
+      outputData.push(rowData);
+      idCounter++;
+    }
+    currentDate.setDate(currentDate.getDate() + 1);
+  }
+  
+  reservationSheet.clearContents(); 
+  reservationSheet.getRange(1, 1, outputData.length, headers.length).setValues(outputData);
+  console.log("予約枠の生成が完了しました！シートをご確認ください。");
+}
+
+// ==========================================
+// 3. LINE WORKS Webhook 受信処理 (doPost)
+// ==========================================
+function doPost(e) {
+  try {
+    if (!e || !e.postData || !e.postData.contents) {
+      return ContentService.createTextOutput("No data");
+    }
+
+    const json = JSON.parse(e.postData.contents);
+    if (!json || !json.source) return ContentService.createTextOutput("OK");
+
+    const type = json.type; 
+    const userId = json.source.accountId || json.source.userId; 
+    
+    if (!userId) return ContentService.createTextOutput("No User ID");
+
+    if (type === 'message') {
+      const text = (json.content && json.content.text) ? json.content.text.trim() : "";
+      
+      // ログ記録：ユーザーからの発言を受信
+      writeLog(userId, "受信", text);
+      
+      const cache = CacheService.getScriptCache();
+      const userEmail = getUserEmail(userId); // 広報メンバー特定用にも先にメアドを取得
+      
+      const pendingTargetId = cache.get('wait_comment_' + userId);
+      const pendingPrTargetId = cache.get('wait_pr_comment_' + userEmail);
+      
+      // システムコマンド判定用
+      const isSystemCommand = text === "" || text === "はい" || text === "いいえ" || text === "キャンセル" || text.startsWith("予約 ") || /^\d{4}\/\d{2}\/\d{2}$/.test(text) || /^\d{4}\/\d{2}\/\d{2}\s\d{2}:\d{2}\s-\s\d{2}:\d{2}$/.test(text);
+
+      // 【1】ドクター自身のコメント入力待ちの場合
+      if (pendingTargetId && !isSystemCommand) {
+        updateReservationComment(pendingTargetId, text);
+        cache.remove('wait_comment_' + userId);
+        sendWorksMessage(userId, { "type": "text", "text": "コメントを保存しました。ありがとうございます！" });
+        writeLog(userId, "コメント保存", `対象予約ID:${pendingTargetId} / 内容:${text}`);
+        updateAdminDashboard(); // 管理画面を更新
+        return ContentService.createTextOutput("OK");
+      }
+      
+      // 【2】広報メンバーからの備考（伝達事項）入力待ちの場合
+      if (pendingPrTargetId && !isSystemCommand) {
+        const prefix = userEmail.split('@')[0];
+        const appendText = `${prefix}:${text}`;
+        updateReservationRemark(pendingPrTargetId, appendText);
+        cache.remove('wait_pr_comment_' + userEmail);
+        sendWorksMessage(userId, { "type": "text", "text": "備考に追記しました。ありがとうございます！" });
+        writeLog(userId, "備考追記", `対象予約ID:${pendingPrTargetId} / 内容:${appendText}`);
+        updateAdminDashboard(); // 管理画面を更新
+        return ContentService.createTextOutput("OK");
+      }
+      
+      // 日付形式（例：2026/07/02）を拾った場合は時間枠選択へ進む
+      if (/^\d{4}\/\d{2}\/\d{2}$/.test(text)) {
+        sendTimeSlots(userId, text);
+        
+      // 日付と時間枠のセット（例：2026/07/02 14:00 - 15:00）を拾った場合は確認窓を出す
+      } else if (/^\d{4}\/\d{2}\/\d{2}\s\d{2}:\d{2}\s-\s\d{2}:\d{2}$/.test(text)) {
+        const matchDate = text.substring(0, 10);
+        const matchTime = text.substring(11);
+        
+        const ss = getTargetSpreadsheet();
+        const reservationSheet = ss.getSheetByName("予約枠");
+        const data = reservationSheet.getDataRange().getValues();
+        let targetId = null;
+        
+        for (let i = 1; i < data.length; i++) {
+          if (data[i][4] === "空き") {
+            let dObj = data[i][1] instanceof Date ? data[i][1] : new Date(data[i][1]);
+            if (isNaN(dObj.getTime())) continue;
+            
+            let rowDateStr = Utilities.formatDate(dObj, "Asia/Tokyo", "yyyy/MM/dd");
+            let rowTimeStr = (data[i][2] instanceof Date ? Utilities.formatDate(data[i][2], "Asia/Tokyo", "HH:mm") : data[i][2]) + " - " + (data[i][3] instanceof Date ? Utilities.formatDate(data[i][3], "Asia/Tokyo", "HH:mm") : data[i][3]);
+            
+            if (rowDateStr === matchDate && rowTimeStr === matchTime) {
+              targetId = data[i][0];
+              break;
+            }
+          }
+        }
+        
+        if (targetId) {
+          sendConfirmationForm(userId, targetId, matchDate, matchTime);
+        } else {
+          sendWorksMessage(userId, { "type": "text", "text": "申し訳ありません。この枠は既に埋まっているか見つかりません。" });
+        }
+        
+      // 【修正】「予約 2026/07/02 14:00 - 15:00」を拾った場合は予約確定処理へ
+      } else if (text.startsWith("予約 ") && /^\d{4}\/\d{2}\/\d{2}\s\d{2}:\d{2}\s-\s\d{2}:\d{2}$/.test(text.substring(3))) {
+        const matchDate = text.substring(3, 13);
+        const matchTime = text.substring(14);
+        
+        const ss = getTargetSpreadsheet();
+        const reservationSheet = ss.getSheetByName("予約枠");
+        const data = reservationSheet.getDataRange().getValues();
+        let targetId = null;
+        
+        for (let i = 1; i < data.length; i++) {
+          if (data[i][4] === "空き") {
+            let dObj = data[i][1] instanceof Date ? data[i][1] : new Date(data[i][1]);
+            if (isNaN(dObj.getTime())) continue;
+            
+            let rowDateStr = Utilities.formatDate(dObj, "Asia/Tokyo", "yyyy/MM/dd");
+            let rowTimeStr = (data[i][2] instanceof Date ? Utilities.formatDate(data[i][2], "Asia/Tokyo", "HH:mm") : data[i][2]) + " - " + (data[i][3] instanceof Date ? Utilities.formatDate(data[i][3], "Asia/Tokyo", "HH:mm") : data[i][3]);
+            
+            if (rowDateStr === matchDate && rowTimeStr === matchTime) {
+              targetId = data[i][0];
+              break;
+            }
+          }
+        }
+        
+        if (targetId) {
+          executeReservation(userId, targetId);
+        } else {
+          sendWorksMessage(userId, { "type": "text", "text": "申し訳ありません。この枠は既に予約されたか見つかりません。" });
+        }
+        
+      // 【修正】キャンセル・いいえは日付選択に戻る
+      } else if (text === "キャンセル" || text === "いいえ") {
+        replyReservationForm(userId);
+        
+      // 「はい」単体等のテキスト発言は無視する
+      } else if (text === "はい") {
+        return ContentService.createTextOutput("OK");
+        
+      // それ以外は何を入れても最初の日付選択へ
+      } else {
+        replyReservationForm(userId);
+      }
+      
+    } else if (type === 'postback') {
+      var postbackData =
+        json.data ||
+        (json.postback && json.postback.data) ||
+        (json.content && json.content.postback && json.content.postback.data) ||
+        (json.content && json.content.postback);
+        
+      processPostback(userId, postbackData);
+    }
+    
+    return ContentService.createTextOutput("OK");
+  } catch (error) {
+    console.error("doPost Error: " + error.message);
+    return ContentService.createTextOutput("Error");
+  }
+}
+
+// --- コメント＆備考更新ヘルパー関数 ---
+function updateReservationComment(targetId, comment) {
+  const ss = getTargetSpreadsheet();
+  const resSheet = ss.getSheetByName("予約枠");
+  const rData = resSheet.getDataRange().getValues();
+  let targetLineId = "";
+  for (let i = 1; i < rData.length; i++) {
+    if (rData[i][0] == targetId) {
+      resSheet.getRange(i + 1, 8).setValue(comment); // H列
+      targetLineId = rData[i][6]; // G列 LINEIDを保持
+      
+      // 【新機能】カレンダーの予定を更新（コメント追加）
+      if (CONFIG.CALENDAR_ID) {
+        try {
+          const cal = CalendarApp.getCalendarById(CONFIG.CALENDAR_ID);
+          if (cal) {
+            let dObj = rData[i][1] instanceof Date ? rData[i][1] : new Date(rData[i][1]);
+            let dateStr = Utilities.formatDate(dObj, "Asia/Tokyo", "yyyy/MM/dd");
+            let stStr = rData[i][2] instanceof Date ? Utilities.formatDate(rData[i][2], "Asia/Tokyo", "HH:mm") : rData[i][2];
+            let etStr = rData[i][3] instanceof Date ? Utilities.formatDate(rData[i][3], "Asia/Tokyo", "HH:mm") : rData[i][3];
+            let startDateTime = new Date(dateStr + " " + stStr);
+            let endDateTime = new Date(dateStr + " " + etStr);
+            let doctorName = rData[i][5];
+            let remark = rData[i][8] || "(未入力)";
+
+            let events = cal.getEvents(startDateTime, endDateTime);
+            for (let ev of events) {
+              if (ev.getTitle().indexOf(doctorName) !== -1) {
+                ev.setDescription(`対象者: ${targetLineId}\n担当医: ${doctorName}\n\n【コメント】\n${comment}\n\n【備考】\n${remark}`);
+                break;
+              }
+            }
+          }
+        } catch(e) {
+          console.error("カレンダー更新エラー: " + e.message);
+        }
+      }
+      break;
+    }
+  }
+  // ドクターマスタのJ列にも反映
+  if (targetLineId) {
+    const masterSheet = ss.getSheetByName("ドクターマスタ");
+    if (masterSheet) {
+      const mData = masterSheet.getDataRange().getValues();
+      for (let j = 1; j < mData.length; j++) {
+        if (mData[j][3] !== "" && targetLineId.indexOf(mData[j][3]) !== -1) {
+          masterSheet.getRange(j + 1, 10).setValue(comment); // J列
+          break;
+        }
+      }
+    }
+  }
+}
+
+function updateReservationRemark(targetId, appendText) {
+  const ss = getTargetSpreadsheet();
+  const resSheet = ss.getSheetByName("予約枠");
+  const rData = resSheet.getDataRange().getValues();
+  let targetLineId = "";
+  for (let i = 1; i < rData.length; i++) {
+    if (rData[i][0] == targetId) {
+      let current = rData[i][8] || ""; // I列
+      let newVal = current === "" ? appendText : current + "," + appendText;
+      resSheet.getRange(i + 1, 9).setValue(newVal);
+      targetLineId = rData[i][6];
+      
+      // 【新機能】カレンダーの予定を更新（備考追加）
+      if (CONFIG.CALENDAR_ID) {
+        try {
+          const cal = CalendarApp.getCalendarById(CONFIG.CALENDAR_ID);
+          if (cal) {
+            let dObj = rData[i][1] instanceof Date ? rData[i][1] : new Date(rData[i][1]);
+            let dateStr = Utilities.formatDate(dObj, "Asia/Tokyo", "yyyy/MM/dd");
+            let stStr = rData[i][2] instanceof Date ? Utilities.formatDate(rData[i][2], "Asia/Tokyo", "HH:mm") : rData[i][2];
+            let etStr = rData[i][3] instanceof Date ? Utilities.formatDate(rData[i][3], "Asia/Tokyo", "HH:mm") : rData[i][3];
+            let startDateTime = new Date(dateStr + " " + stStr);
+            let endDateTime = new Date(dateStr + " " + etStr);
+            let doctorName = rData[i][5];
+            let comment = rData[i][7] || "(未入力)";
+
+            let events = cal.getEvents(startDateTime, endDateTime);
+            for (let ev of events) {
+              if (ev.getTitle().indexOf(doctorName) !== -1) {
+                ev.setDescription(`対象者: ${targetLineId}\n担当医: ${doctorName}\n\n【コメント】\n${comment}\n\n【備考】\n${newVal}`);
+                break;
+              }
+            }
+          }
+        } catch(e) {
+          console.error("カレンダー更新エラー: " + e.message);
+        }
+      }
+      
+      // ドクターマスタのK列にも反映
+      const masterSheet = ss.getSheetByName("ドクターマスタ");
+      if (masterSheet) {
+        const mData = masterSheet.getDataRange().getValues();
+        for (let j = 1; j < mData.length; j++) {
+          if (mData[j][3] !== "" && targetLineId.indexOf(mData[j][3]) !== -1) {
+            let mCurrent = mData[j][10] || ""; // K列
+            let mNewVal = mCurrent === "" ? appendText : mCurrent + "," + appendText;
+            masterSheet.getRange(j + 1, 11).setValue(mNewVal); // K列
+            break;
+          }
+        }
+      }
+      break;
+    }
+  }
+}
+
+
+// ==========================================
+// 4. STEP1: 日付選択フォーム（週ごとのカルーセル）送信処理
+// ==========================================
+function replyReservationForm(userId) {
+  const ss = getTargetSpreadsheet();
+  const reservationSheet = ss.getSheetByName("予約枠");
+  const data = reservationSheet.getDataRange().getValues();
+  
+  const uniqueDateMap = {};
+  const todayStr = Utilities.formatDate(new Date(), "Asia/Tokyo", "yyyy/MM/dd");
+
+  for (let i = 1; i < data.length; i++) {
+    const row = data[i];
+    if (row[4] === "空き") { 
+      let d = row[1];
+      let dateObj = d instanceof Date ? d : new Date(d);
+      if (isNaN(dateObj.getTime())) continue;
+
+      let dateStr = Utilities.formatDate(dateObj, "Asia/Tokyo", "yyyy/MM/dd");
+      
+      // 今日の日付を考慮し、過去の日は除外
+      if (dateStr < todayStr) continue;
+
+      let dayOfWeek = dateObj.getDay();
+      // 土日を除外（月:1 〜 金:5 のみ処理）
+      if (dayOfWeek === 0 || dayOfWeek === 6) continue;
+
+      if (!uniqueDateMap[dateStr]) {
+        uniqueDateMap[dateStr] = {
+          dateObj: dateObj,
+          dateStr: dateStr,
+          dayOfWeek: dayOfWeek
+        };
+      }
+    }
+  }
+
+  const availableDates = Object.values(uniqueDateMap).sort((a, b) => a.dateObj - b.dateObj);
+
+  if (availableDates.length === 0) {
+    sendWorksMessage(userId, {
+      "type": "text",
+      "text": "現在、ご予約可能な平日（月〜金）のインタビュー枠がありません。"
+    });
+    return;
+  }
+
+  // 週（月曜日起点）ごとにデータをグループ化
+  const weeksMap = {};
+  availableDates.forEach(item => {
+    let mon = new Date(item.dateObj.getTime());
+    let diff = item.dayOfWeek - 1; 
+    mon.setDate(mon.getDate() - diff);
+    let monStr = Utilities.formatDate(mon, "Asia/Tokyo", "yyyy/MM/dd");
+    
+    if (!weeksMap[monStr]) weeksMap[monStr] = {};
+    weeksMap[monStr][item.dayOfWeek] = item;
+  });
+
+  const weekKeys = Object.keys(weeksMap).sort();
+  const bubbles = [];
+  const weekNames = ["日", "月", "火", "水", "木", "金", "土"];
+
+  // 各週ごとのバブル（枠）を作成
+  for (let i = 0; i < weekKeys.length; i++) {
+    if (bubbles.length >= 10) break; // Flex Carouselの最大値
+    let monStr = weekKeys[i];
+    let monObj = new Date(monStr);
+    let weekTitle = Utilities.formatDate(monObj, "Asia/Tokyo", "MM/dd") + "の週";
+
+    let bubble = {
+      "type": "bubble",
+      "body": {
+        "type": "box",
+        "layout": "vertical",
+        "contents": [
+          {
+            "type": "text",
+            "text": weekTitle,
+            "weight": "bold",
+            "size": "md",
+            "color": "#333333"
+          },
+          {
+            "type": "text",
+            "text": "ご希望の日付を選択してください",
+            "size": "xs",
+            "color": "#888888",
+            "margin": "sm"
+          },
+          {
+            "type": "separator",
+            "margin": "md"
+          }
+        ]
+      }
+    };
+
+    // 月曜(1)から金曜(5)まで5日分を強制的にループして配置
+    for (let d = 1; d <= 5; d++) {
+      let item = weeksMap[monStr][d];
+      let targetDate = new Date(monObj.getTime());
+      targetDate.setDate(targetDate.getDate() + (d - 1));
+      let labelStr = Utilities.formatDate(targetDate, "Asia/Tokyo", "MM/dd") + "(" + weekNames[d] + ")";
+      let checkDateStr = Utilities.formatDate(targetDate, "Asia/Tokyo", "yyyy/MM/dd");
+
+      // 過去の日付は満枠と同じ扱いでボタンを表示させない
+      if (item && checkDateStr >= todayStr) {
+        // 空き枠がある日は青いボタン（テキスト発言アクション）
+        bubble.body.contents.push({
+          "type": "button",
+          "style": "primary",
+          "margin": "sm",
+          "action": {
+            "type": "message",
+            "label": labelStr,
+            "text": item.dateStr
+          }
+        });
+      } else {
+        // 空き枠がない日、または過去の日はグレーのテキストで「満枠」として表示
+        bubble.body.contents.push({
+          "type": "box",
+          "layout": "vertical",
+          "margin": "sm",
+          "paddingAll": "10px",
+          "backgroundColor": "#f4f4f4",
+          "cornerRadius": "md",
+          "contents": [
+            {
+              "type": "text",
+              "text": labelStr + " - 満枠",
+              "size": "sm",
+              "color": "#aaaaaa",
+              "align": "center",
+              "weight": "bold"
+            }
+          ]
+        });
+      }
+    }
+    bubbles.push(bubble);
+  }
+
+  const messageContent = {
+    "type": "flex",
+    "altText": "予約可能な日付一覧",
+    "contents": {
+      "type": "carousel",
+      "contents": bubbles
+    }
+  };
+
+  sendWorksMessage(userId, messageContent);
+}
+
+// ==========================================
+// 5. STEP2: 時間選択フォーム（日付ごとのカルーセル）送信処理
+// ==========================================
+function sendTimeSlots(userId, selectedDateStr) {
+  const ss = getTargetSpreadsheet();
+  const reservationSheet = ss.getSheetByName("予約枠");
+  const data = reservationSheet.getDataRange().getValues();
+  
+  // 【修正】空き枠だけでなく、その日のすべての枠を取得するように変更
+  const availableSlots = [];
+  for (let i = 1; i < data.length; i++) {
+    const row = data[i];
+    let d = row[1];
+    let dateObj = d instanceof Date ? d : new Date(d);
+    if (isNaN(dateObj.getTime())) continue;
+    
+    let rowDateStr = Utilities.formatDate(dateObj, "Asia/Tokyo", "yyyy/MM/dd");
+    if (rowDateStr === selectedDateStr) {
+      availableSlots.push({
+        id: row[0],
+        start: row[2],
+        end: row[3],
+        status: row[4] // 状態（空き、予約済など）を保持
+      });
+    }
+  }
+
+  if (availableSlots.length === 0) {
+    sendWorksMessage(userId, {
+      "type": "text",
+      "text": "申し訳ありません。選択された日付には枠が設定されていません。"
+    });
+    return;
+  }
+
+  const dateObj = new Date(selectedDateStr);
+  const weekNames = ["日", "月", "火", "水", "木", "金", "土"];
+  const displayDate = Utilities.formatDate(dateObj, "Asia/Tokyo", "MM/dd") + "(" + weekNames[dateObj.getDay()] + ")";
+
+  const bubbles = [];
+  let currentBubble = null;
+
+  // 1つの枠に最大8コマまで収める（それ以上なら次の枠へ）
+  for (let i = 0; i < availableSlots.length; i++) {
+    if (i % 8 === 0) {
+      if (bubbles.length >= 10) break;
+      currentBubble = {
+        "type": "bubble",
+        "body": {
+          "type": "box",
+          "layout": "vertical",
+          "contents": [
+            {
+              "type": "text",
+              "text": `${displayDate} の予約枠`, // テキストを少し調整
+              "weight": "bold",
+              "size": "md",
+              "color": "#333333"
+            },
+            {
+              "type": "text",
+              "text": "ご希望の時間を選択してください",
+              "size": "xs",
+              "color": "#888888",
+              "margin": "sm"
+            },
+            {
+              "type": "separator",
+              "margin": "md"
+            }
+          ]
+        }
+      };
+      bubbles.push(currentBubble);
+    }
+
+    const slot = availableSlots[i];
+    const timeStr = (slot.start instanceof Date ? Utilities.formatDate(slot.start, "Asia/Tokyo", "HH:mm") : slot.start) 
+                  + " - " 
+                  + (slot.end instanceof Date ? Utilities.formatDate(slot.end, "Asia/Tokyo", "HH:mm") : slot.end);
+
+    // 【追加機能】ステータスが「空き」なら青いボタン、それ以外ならグレーのテキストボックス
+    if (slot.status === "空き") {
+      currentBubble.body.contents.push({
+        "type": "button",
+        "style": "primary",
+        "margin": "sm",
+        "action": {
+          "type": "message",
+          "label": timeStr,
+          "text": `${selectedDateStr} ${timeStr}`
+        }
+      });
+    } else {
+      currentBubble.body.contents.push({
+        "type": "box",
+        "layout": "vertical",
+        "margin": "sm",
+        "paddingAll": "10px",
+        "backgroundColor": "#f4f4f4",
+        "cornerRadius": "md",
+        "contents": [
+          {
+            "type": "text",
+            "text": timeStr + " - 予約済",
+            "size": "sm",
+            "color": "#aaaaaa",
+            "align": "center",
+            "weight": "bold"
+          }
+        ]
+      });
+    }
+  }
+
+  const messageContent = {
+    "type": "flex",
+    "altText": `${displayDate} の時間を選択`,
+    "contents": {
+      "type": "carousel",
+      "contents": bubbles
+    }
+  };
+
+  sendWorksMessage(userId, messageContent);
+}
+
+// ==========================================
+// 6. Postback 振り分け・予約確定処理
+// ==========================================
+function processPostback(userId, postbackData) {
+  if (!postbackData) return;
+  
+  const params = {};
+  postbackData.split("&").forEach(function(p) {
+    const kv = p.split("=");
+    if (kv.length === 2) {
+      params[kv[0]] = decodeURIComponent(kv[1]);
+    }
+  });
+
+  // STEP1から呼ばれた場合（日付選択）※現在はmessage発言で拾うため使われませんが、念のため維持
+  if (params.action === "select_date" && params.date) {
+    sendTimeSlots(userId, params.date);
+    
+  // 時間枠選択後、確認メッセージを出す処理 ※現在はmessage発言で拾うため使われませんが、念のため維持
+  } else if (params.action === "confirm" && params.id) {
+    sendConfirmationForm(userId, params.id, params.date, params.time);
+
+  // 確認メッセージで「いいえ」が押された場合、日付選択に戻る ※現在はmessage発言で拾うため使われませんが、念のため維持
+  } else if (params.action === "cancel") {
+    replyReservationForm(userId);
+
+  // 確認メッセージで「はい」が押された場合、予約確定処理へ ※現在はmessage発言で拾うため使われませんが、念のため維持
+  } else if (params.action === "reserve" && params.id) {
+    executeReservation(userId, parseInt(params.id, 10));
+  }
+}
+
+// ==========================================
+// 6.5. 確認フォーム送信処理
+// ==========================================
+function sendConfirmationForm(userId, id, dateStr, timeStr) {
+  const confirmText = `この${dateStr}、${timeStr}～でよろしいですか？`;
+  
+  const messageContent = {
+    "type": "flex",
+    "altText": "予約内容の確認",
+    "contents": {
+      "type": "bubble",
+      "body": {
+        "type": "box",
+        "layout": "vertical",
+        "contents": [
+          {
+            "type": "text",
+            "text": "予約確認",
+            "weight": "bold",
+            "size": "md",
+            "color": "#333333"
+          },
+          {
+            "type": "text",
+            "text": confirmText,
+            "wrap": true,
+            "size": "sm",
+            "margin": "md"
+          }
+        ]
+      },
+      "footer": {
+        "type": "box",
+        "layout": "horizontal",
+        "spacing": "sm",
+        "contents": [
+          {
+            "type": "button",
+            "style": "primary",
+            "action": {
+              // 【修正】postbackによる競合を避けるため、テキストメッセージで情報を送信
+              "type": "message",
+              "label": "はい",
+              "text": `予約 ${dateStr} ${timeStr}`
+            }
+          },
+          {
+            "type": "button",
+            "action": {
+              // 【修正】テキストメッセージでキャンセルを送信
+              "type": "message",
+              "label": "いいえ",
+              "text": "キャンセル"
+            }
+          }
+        ]
+      }
+    }
+  };
+
+  sendWorksMessage(userId, messageContent);
+}
+
+// ==========================================
+// 7. 予約確定処理
+// ==========================================
+function executeReservation(userId, targetId) {
+  const ss = getTargetSpreadsheet();
+  
+  // 【新機能】LINE WORKS APIでユーザーのアドレス形式ID(email)を取得
+  const userEmail = getUserEmail(userId);
+  
+  const reservationSheet = ss.getSheetByName("予約枠");
+  const rData = reservationSheet.getDataRange().getValues();
+  
+  // ドクターマスタから医師名を取得 (UUIDではなく取得したアドレスで照合)
+  const masterSheet = ss.getSheetByName("ドクターマスタ");
+  let doctorName = "不明";
+  if (masterSheet) {
+    const mData = masterSheet.getDataRange().getValues();
+    for (let j = 1; j < mData.length; j++) {
+      // D列(インデックス3)のLINE IDが userEmail に含まれるか部分一致で判定（ドメイン違い対策）
+      if (mData[j][3] !== "" && userEmail.indexOf(mData[j][3]) !== -1) {
+        doctorName = mData[j][1]; // B列: 医師名を取得
+        break;
+      }
+    }
+  }
+
+  let reservedSlotInfo = null;
+  
+  for (let i = 1; i < rData.length; i++) {
+    if (rData[i][0] === targetId) {
+      if (rData[i][4] !== "空き") {
+        sendWorksMessage(userId, { "type": "text", "text": "申し訳ありません。この枠は既に予約されてしまいました。" });
+        return;
+      }
+      reservationSheet.getRange(i + 1, 5).setValue("予約済");
+      reservationSheet.getRange(i + 1, 6).setValue(doctorName); // F列(医師)に書き込み
+      reservationSheet.getRange(i + 1, 7).setValue(userEmail);  // G列(LINEID)にアドレス形式で書き込み
+      
+      reservedSlotInfo = {
+        date: rData[i][1] instanceof Date ? Utilities.formatDate(rData[i][1], "Asia/Tokyo", "yyyy/MM/dd") : rData[i][1],
+        time: (rData[i][2] instanceof Date ? Utilities.formatDate(rData[i][2], "Asia/Tokyo", "HH:mm") : rData[i][2]) + " - " + (rData[i][3] instanceof Date ? Utilities.formatDate(rData[i][3], "Asia/Tokyo", "HH:mm") : rData[i][3]),
+        // 完了メッセージ用に開始時間のみを抽出
+        startTime: rData[i][2] instanceof Date ? Utilities.formatDate(rData[i][2], "Asia/Tokyo", "HH:mm") : rData[i][2]
+      };
+      break;
+    }
+  }
+
+  if (!reservedSlotInfo) return;
+
+  if (masterSheet) {
+    const mData = masterSheet.getDataRange().getValues();
+    let found = false;
+    const reservationDateTimeStr = `${reservedSlotInfo.date} ${reservedSlotInfo.time}`;
+    
+    for (let j = 1; j < mData.length; j++) {
+      if (mData[j][3] !== "" && userEmail.indexOf(mData[j][3]) !== -1) {
+        masterSheet.getRange(j + 1, 5).setValue(reservationDateTimeStr); 
+        masterSheet.getRange(j + 1, 6).setValue("済"); 
+        found = true;
+        break;
+      }
+    }
+    
+    if (!found) {
+      const newRow = ["", doctorName, "", userEmail, reservationDateTimeStr, "済", "", "", "", "", ""];
+      masterSheet.appendRow(newRow);
+    }
+  }
+
+  // 完了メッセージを送信 (スッキリ版に戻す)
+  sendWorksMessage(userId, {
+    "type": "text",
+    "text": `予約完了 ${reservedSlotInfo.date} ${reservedSlotInfo.startTime}～\n※場所は[会議室2]です。場所変更希望の方はお手数ですが場所予約の上、このままチャットに場所記入お願いします。その他伝達事項もあればチャットお願いします`
+  });
+
+  // 【追加機能】設定シートのB5以降にあるLINEID宛に通知を送信
+  const settingSheet = ss.getSheetByName("設定");
+  if (settingSheet) {
+    const sLastRow = settingSheet.getLastRow();
+    if (sLastRow >= 5) {
+      const notifyTargets = settingSheet.getRange(5, 2, sLastRow - 4, 1).getValues().flat().filter(String);
+      if (notifyTargets.length > 0) {
+        const notifyContent = {
+          "type": "text",
+          "text": `【新規予約受付】\n対象者: ${userEmail}\n日時: ${reservedSlotInfo.date} ${reservedSlotInfo.startTime}～\nお名前: ${doctorName}\n※備考や伝達事項がある広報委員はコメントすると備考に追記されます`
+        };
+        notifyTargets.forEach(function(notifyEmail) {
+          if (notifyEmail.trim() !== "") {
+            sendWorksMessage(notifyEmail.trim(), notifyContent);
+            // 広報メンバーへの通知後、そのメアドをキーにして備考入力待ち状態にする
+            CacheService.getScriptCache().put('wait_pr_comment_' + notifyEmail.trim(), targetId.toString(), 3600);
+          }
+        });
+      }
+    }
+  }
+
+  // ログ記録：予約が完了したことを記録
+  writeLog(userEmail, "予約確定", `日時: ${reservedSlotInfo.date} ${reservedSlotInfo.startTime}～ / お名前: ${doctorName}`);
+  
+  // 【新機能】Googleカレンダーに予定を登録
+  if (CONFIG.CALENDAR_ID) {
+    try {
+      const cal = CalendarApp.getCalendarById(CONFIG.CALENDAR_ID);
+      if (cal) {
+        const timeParts = reservedSlotInfo.time.split(" - ");
+        const startDateTime = new Date(reservedSlotInfo.date + " " + timeParts[0]);
+        const endDateTime = new Date(reservedSlotInfo.date + " " + timeParts[1]);
+        const title = `[ｲﾝﾀﾋﾞｭｰ] ${doctorName} 様`;
+        const description = `対象者: ${userEmail}\n担当医: ${doctorName}\n\n【コメント】\n(未入力)\n\n【備考】\n(未入力)`;
+        cal.createEvent(title, startDateTime, endDateTime, { description: description });
+      }
+    } catch(e) {
+      console.error("カレンダー登録エラー: " + e.message);
+    }
+  }
+  
+  // ドクター本人のコメント受け取り用に一時的にステータスをキャッシュ（1時間有効）
+  CacheService.getScriptCache().put('wait_comment_' + userId, targetId.toString(), 3600);
+  
+  // 管理画面の更新を呼び出し
+  updateAdminDashboard();
+}
+
+// ==========================================
+// 8. LINE WORKS API 通信関連
+// ==========================================
+function repairPrivateKey(key) {
+  if (!key) return "";
+  const header = "-----BEGIN PRIVATE KEY-----";
+  const footer = "-----END PRIVATE KEY-----";
+  let normalizedKey = key.replace(/\\n/g, '\n').replace(/\\r/g, '');
+  if (normalizedKey.indexOf(header) !== -1 && normalizedKey.indexOf(footer) !== -1) {
+    let body = normalizedKey.substring(normalizedKey.indexOf(header) + header.length, normalizedKey.indexOf(footer));
+    body = body.replace(/\s+/g, '');
+    let formattedBody = body.match(/.{1,64}/g).join('\n');
+    return header + '\n' + formattedBody + '\n' + footer;
+  }
+  return key;
+}
+
+function getAccessToken() {
+  var cache = CacheService.getScriptCache();
+  // 【修正点】キャッシュキーをV3に変更し、確実に追加権限なしのクリーンなトークンを取り直す
+  var token = cache.get('LINEWORKS_TOKEN_V3');
+  if (token) return token;
+
+  const privateKey = repairPrivateKey(CONFIG.PRIVATE_KEY);
+  const now = Math.floor(Date.now() / 1000);
+  const header = { alg: "RS256", typ: "JWT" };
+
+  const payload = {
+    iss: CONFIG.CLIENT_ID.trim(),
+    sub: CONFIG.SERVICE_ACCOUNT.trim(),
+    iat: now,
+    exp: now + 3600
+  };
+
+  const encodedHeader = Utilities.base64EncodeWebSafe(JSON.stringify(header));
+  const encodedPayload = Utilities.base64EncodeWebSafe(JSON.stringify(payload));
+  const signingInput = encodedHeader + "." + encodedPayload;
+
+  const signatureBytes = Utilities.computeRsaSha256Signature(signingInput, privateKey);
+  const encodedSignature = Utilities.base64EncodeWebSafe(signatureBytes);
+  const jwt = signingInput + "." + encodedSignature;
+
+  const response = UrlFetchApp.fetch(
+    "https://auth.worksmobile.com/oauth2/v2.0/token", 
+    {
+      method: "post",
+      payload: {
+        assertion: jwt,
+        grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
+        client_id: CONFIG.CLIENT_ID.trim(),
+        client_secret: CONFIG.CLIENT_SECRET.trim(),
+        // 【重要修正】コンソール画面で設定済みの権限のみを確実に要求するよう修正
+        scope: "bot,user.read"
+      },
+      muteHttpExceptions: true
+    }
+  );
+
+  const text = response.getContentText();
+  if (!text.startsWith("{")) throw new Error("Token取得失敗: " + text);
+  
+  const json = JSON.parse(text);
+  if (!json.access_token) throw new Error(text);
+
+  cache.put('LINEWORKS_TOKEN_V3', json.access_token, 3000);
+  return json.access_token;
+}
+
+// 【新機能】APIを叩いてユーザー情報を取得する関数
+function getUserEmail(userId) {
+  var url = "https://www.worksapis.com/v1.0/users/" + userId;
+  var options = {
+    method: "get",
+    headers: {
+      Authorization: "Bearer " + getAccessToken()
+    },
+    muteHttpExceptions: true
+  };
+  
+  var response = UrlFetchApp.fetch(url, options);
+  if (response.getResponseCode() === 200) {
+    var json = JSON.parse(response.getContentText());
+    
+    // emailだけでなく他のキーに入っていた場合もカバー
+    var emailStr = json.email || json.externalEmail || json.userEmail || "";
+    
+    if (emailStr) {
+      // 取得したメールアドレスの＠より前を取り出し、@torikagoを付ける
+      var parts = emailStr.split('@');
+      return parts[0] + "@torikago"; 
+    }
+    return userId; // emailが取得できなければUUIDを返す
+  } else {
+    console.error("User情報取得失敗: " + response.getContentText());
+    return userId; // 取得失敗時は安全のためUUIDを返す
+  }
+}
+
+function sendWorksMessage(userId, messageContent) {
+  var url = "https://www.worksapis.com/v1.0/bots/" + CONFIG.BOT_ID + "/users/" + userId + "/messages";
+  var options = {
+    method: "post",
+    headers: {
+      Authorization: "Bearer " + getAccessToken(),
+      "Content-Type": "application/json"
+    },
+    payload: JSON.stringify({
+      content: messageContent
+    }),
+    muteHttpExceptions: true
+  };
+  var response = UrlFetchApp.fetch(url, options);
+  if (response.getResponseCode() !== 200 && response.getResponseCode() !== 201) {
+    console.error("Message送信失敗: " + response.getContentText());
+  }
+}
+
+// ==========================================
+// 9. ログ記録機能（追加）
+// ==========================================
+function writeLog(userId, action, details) {
+  try {
+    const ss = getTargetSpreadsheet();
+    let logSheet = ss.getSheetByName("ログ");
+    
+    // ログシートが存在しない場合は自動作成
+    if (!logSheet) {
+      logSheet = ss.insertSheet("ログ");
+      logSheet.getRange("A1:D1").setValues([["日時", "ユーザーID", "アクション", "詳細"]]);
+      logSheet.getRange("A1:D1").setFontWeight("bold");
+    }
+    
+    const timestamp = Utilities.formatDate(new Date(), "Asia/Tokyo", "yyyy/MM/dd HH:mm:ss");
+    logSheet.appendRow([timestamp, userId, action, details]);
+  } catch (error) {
+    console.error("ログ記録エラー: " + error.message);
+  }
+}
+
+// ==========================================
+// 10. リマインド通知機能
+// ※GASの「トリガー」設定で、この関数を1分または5分おきに実行してください
+// ==========================================
+function sendReminders() {
+  const ss = getTargetSpreadsheet();
+  const settingSheet = ss.getSheetByName("設定");
+  const reservationSheet = ss.getSheetByName("予約枠");
+  
+  if (!settingSheet || !reservationSheet) return;
+  
+  let todayRemindTimeStr = settingSheet.getRange("C5").getDisplayValue(); // 例: "9:00"
+  let justBeforeMins = parseInt(settingSheet.getRange("D5").getValue(), 10);
+  
+  if (!todayRemindTimeStr) todayRemindTimeStr = "9:00"; 
+  if (isNaN(justBeforeMins)) justBeforeMins = 10; 
+  
+  const now = new Date();
+  const todayStr = Utilities.formatDate(now, "Asia/Tokyo", "yyyy/MM/dd");
+  const nowMs = now.getTime();
+  
+  const rData = reservationSheet.getDataRange().getValues();
+  const cache = CacheService.getScriptCache();
+  
+  for (let i = 1; i < rData.length; i++) {
+    if (rData[i][4] === "予約済") {
+      const resId = rData[i][0];
+      const dateVal = rData[i][1];
+      const startVal = rData[i][2]; 
+      const doctorLineId = rData[i][6]; 
+      
+      if (!doctorLineId) continue;
+      
+      let dObj = dateVal instanceof Date ? dateVal : new Date(dateVal);
+      if (isNaN(dObj.getTime())) continue;
+      
+      let rowDateStr = Utilities.formatDate(dObj, "Asia/Tokyo", "yyyy/MM/dd");
+      
+      // 予約が「今日」の場合のみチェック
+      if (rowDateStr === todayStr) {
+        
+        // 予約開始時間のDateオブジェクトを生成
+        let resStartObj = new Date(dObj.getTime());
+        if (startVal instanceof Date) {
+          resStartObj.setHours(startVal.getHours(), startVal.getMinutes(), 0, 0);
+        } else {
+          let parts = startVal.toString().split(":");
+          resStartObj.setHours(parseInt(parts[0], 10), parseInt(parts[1], 10), 0, 0);
+        }
+        const resStartMs = resStartObj.getTime();
+        
+        // 当日リマインド時間のDateオブジェクトを生成
+        let todayRemindObj = new Date(dObj.getTime());
+        let tParts = todayRemindTimeStr.split(":");
+        todayRemindObj.setHours(parseInt(tParts[0], 10), parseInt(tParts[1], 10), 0, 0);
+        const todayRemindMs = todayRemindObj.getTime();
+        
+        // 直前リマインド時間
+        const justBeforeMs = resStartMs - (justBeforeMins * 60 * 1000);
+        
+        // ① 当日リマインド送信判定
+        if (nowMs >= todayRemindMs && !cache.get('reminded_today_' + resId)) {
+          let text = `【本日リマインド】\n本日 ${Utilities.formatDate(resStartObj, "Asia/Tokyo", "HH:mm")}～ インタビュー予定です。\nよろしくお願いします。`;
+          sendWorksMessage(doctorLineId, { "type": "text", "text": text });
+          cache.put('reminded_today_' + resId, 'true', 24 * 60 * 60); // 24時間キャッシュ（重複送信防止）
+          writeLog(doctorLineId, "当日リマインド", `ID:${resId}`);
+        }
+        
+        // ② 直前リマインド送信判定
+        if (nowMs >= justBeforeMs && !cache.get('reminded_justbefore_' + resId)) {
+          let text = `【直前リマインド】\nまもなく ${Utilities.formatDate(resStartObj, "Asia/Tokyo", "HH:mm")} よりインタビューが開始されます。\nご準備をお願いします。`;
+          sendWorksMessage(doctorLineId, { "type": "text", "text": text });
+          cache.put('reminded_justbefore_' + resId, 'true', 24 * 60 * 60); // 重複送信防止
+          writeLog(doctorLineId, "直前リマインド", `ID:${resId}`);
+        }
+      }
+    }
+  }
+}
+
+// ==========================================
+// 11. 管理画面（進捗の集計機能）自動更新
+// ==========================================
+function updateAdminDashboard() {
+  const ss = getTargetSpreadsheet();
+  let adminSheet = ss.getSheetByName("管理画面");
+  if (!adminSheet) {
+    adminSheet = ss.insertSheet("管理画面");
+  }
+  
+  const masterSheet = ss.getSheetByName("ドクターマスタ");
+  if (!masterSheet) return;
+  
+  const mData = masterSheet.getDataRange().getValues();
+  
+  const statuses = ["未予約", "予約済", "ｲﾝﾀﾋﾞｭｰ済", "編集済み", "公開済み"];
+  const doctorLists = { "未予約": [], "予約済": [], "ｲﾝﾀﾋﾞｭｰ済": [], "編集済み": [], "公開済み": [] };
+  const counts = {};
+  statuses.forEach(s => counts[s] = {});
+  
+  // 動的に「センター」の種類を取得して対応
+  let uniqueCenters = new Set();
+  for (let j = 1; j < mData.length; j++) {
+    let center = mData[j][0];
+    if (center) uniqueCenters.add(center);
+  }
+  let centersArr = Array.from(uniqueCenters);
+  if (centersArr.length === 0) centersArr = ["脊椎", "上肢", "下肢", "人工", "総合・専門"];
+  
+  statuses.forEach(s => {
+    centersArr.forEach(c => counts[s][c] = 0);
+  });
+  
+  // マスタのデータを1行ずつ舐めて振り分け
+  for (let j = 1; j < mData.length; j++) {
+    let row = mData[j];
+    let center = row[0] || "不明";
+    let docName = row[1]; // B列:医師名
+    if (!docName) continue;
+    
+    // F〜I列のステータス判定（右側が優先度高）
+    let isRes = row[5] === "済"; // F列
+    let isInt = row[6] === "済"; // G列
+    let isEdi = row[7] === "済"; // H列
+    let isPub = row[8] === "済"; // I列
+    
+    let status = "未予約";
+    if (isPub) status = "公開済み";
+    else if (isEdi) status = "編集済み";
+    else if (isInt) status = "ｲﾝﾀﾋﾞｭｰ済";
+    else if (isRes) status = "予約済";
+    
+    doctorLists[status].push(docName);
+    
+    if (counts[status][center] !== undefined) {
+       counts[status][center]++;
+    } else {
+       counts[status][center] = 1;
+    }
+  }
+  
+  // A〜E列：ステータスごとのドクター名リスト出力
+  let maxLen = 0;
+  statuses.forEach(s => { if (doctorLists[s].length > maxLen) maxLen = doctorLists[s].length; });
+  
+  let listArray = [];
+  listArray.push(statuses); 
+  for (let r = 0; r < maxLen; r++) {
+    let rowObj = [];
+    statuses.forEach(s => {
+      rowObj.push(doctorLists[s][r] || "");
+    });
+    listArray.push(rowObj);
+  }
+  
+  adminSheet.clearContents(); 
+  if (listArray.length > 0) {
+    adminSheet.getRange(1, 1, listArray.length, 5).setValues(listArray);
+  }
+  
+  // F〜K列：センターごとの集計表出力
+  let aggHeader = [""];
+  centersArr.forEach(c => aggHeader.push(c));
+  let aggArray = [aggHeader];
+  
+  statuses.forEach(s => {
+    let rowObj = [s];
+    centersArr.forEach(c => {
+      rowObj.push(counts[s][c] || 0);
+    });
+    aggArray.push(rowObj);
+  });
+  
+  adminSheet.getRange(1, 6, aggArray.length, aggArray[0].length).setValues(aggArray);
+}
