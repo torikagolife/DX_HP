@@ -1,0 +1,500 @@
+function doGet() {
+  return HtmlService.createHtmlOutputFromFile('index')
+    .setTitle('外来スケジュール登録システム')
+    .addMetaTag('viewport', 'width=device-width, initial-scale=1');
+}
+
+function processExcelUpload(fileObj) {
+  try {
+    const decoded = Utilities.base64Decode(fileObj.base64);
+    const blob = Utilities.newBlob(decoded);
+    
+    // 🌟CSVとして直接読み込む（文字化け対策込み）
+    let text = blob.getDataAsString("Shift_JIS");
+    if (text.includes('')) { text = blob.getDataAsString("UTF-8"); }
+    text = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+    
+    const values = Utilities.parseCsv(text);
+    if (!values || values.length < 4) throw new Error("ファイルの内容が読み込めません。");
+
+    // 年月の抽出
+    const row0Str = values[0].join("");
+    const yearMatch = row0Str.match(/(\d{4})年/);
+    const monthMatch = row0Str.match(/年(\d+)月/);
+    const year = yearMatch ? yearMatch[1] : new Date().getFullYear();
+    const month = monthMatch ? monthMatch[1] : (new Date().getMonth() + 1);
+
+    // カテゴリと役割の読み込み
+    let categories = values[1].map(v => v ? v.toString().replace(/\n/g, "") : "");
+    let subCategories = values[2].map(v => v ? v.toString().replace(/\n/g, "") : "");
+
+    let outputData = [];
+    for(let r = 3; r < values.length; r++) {
+      let day = values[r][0];
+      if(!day || isNaN(day)) continue;
+
+      let dateStr = `${year}/${String(month).padStart(2, '0')}/${String(day).padStart(2, '0')}`;
+
+      for(let c = 2; c < values[r].length; c++) {
+        let doctorStr = values[r][c] ? values[r][c].toString().trim() : "";
+        if(!doctorStr || doctorStr === "NaN") continue;
+
+        let doctorsList = doctorStr.split(/[\/\n]/);
+        for (let docName of doctorsList) {
+          docName = docName.trim();
+          if (!docName) continue;
+
+          let rawCat = categories[c];
+          let rawSub = subCategories[c];
+          
+          let finalAmPm = rawCat.includes("午前") ? "午前" : (rawCat.includes("午後") ? "午後" : "終日");
+          let finalRole = rawSub;
+
+          if (rawCat.includes("回復期") || rawCat.includes("救急")) {
+            finalRole = "回復・救急";
+            finalAmPm = (rawSub.includes("9時") || rawSub === "午前") ? "午前" : "午後";
+          } else if (rawCat.includes("残り番") || rawCat.includes("当直")) {
+            finalAmPm = "午後";
+            finalRole = rawCat.includes("残り番") ? "残り番" : "当直";
+          }
+          
+          outputData.push([dateStr, "船橋", finalAmPm, finalRole, docName]);
+        }
+      }
+    }
+
+    const activeSS = SpreadsheetApp.openById(PropertiesService.getScriptProperties().getProperty("SPREADSHEET_ID"));
+    let targetSheet = activeSS.getSheetByName("スケジュール船橋");
+    if (!targetSheet) {
+      targetSheet = activeSS.insertSheet("スケジュール船橋");
+      targetSheet.appendRow(["日付", "拠点", "午前/午後", "役割", "医師名"]);
+    }
+    
+    if (outputData.length > 0) {
+      targetSheet.getRange(targetSheet.getLastRow() + 1, 1, outputData.length, 5).setValues(outputData);
+    }
+
+    return `🎉 大成功！\n${outputData.length}件をDBに展開しました。`;
+
+  } catch (err) {
+    throw new Error("解析エラー: " + err.toString());
+  }
+}
+
+// テスト実行用関数（まずはこれでログ出力して確認してください）
+function testGenerateMessage() {
+  // 抽出したい日付を指定（Excelデータにある日付にしてください）
+  const targetDate = "2026/06/01"; 
+  const message = generateScheduleMessage(targetDate);
+  // Flexible Templateのオブジェクト形式になるため、JSON文字列として出力して中身を確認します
+  console.log(JSON.stringify(message, null, 2));
+}
+
+// データベースから指定日の通知テキスト（Flexible Templateオブジェクト）を組み立てる関数
+function generateScheduleMessage(targetDateStr) {
+  const ss = SpreadsheetApp.openById(PropertiesService.getScriptProperties().getProperty("SPREADSHEET_ID"));
+  
+  // ★追加：表示用に曜日を算出する処理
+  const _dateParts = targetDateStr.split('/');
+  const _dObj = new Date(Number(_dateParts[0]), Number(_dateParts[1]) - 1, Number(_dateParts[2]));
+  const _dowStr = ["日", "月", "火", "水", "木", "金", "土"][_dObj.getDay()];
+  const displayDateStr = `${targetDateStr}(${_dowStr})`;
+
+  // ドクターマスタの読み込み（A列:名前、B列:アカウントID、★C列:チーム を取得）
+  const masterSheet = ss.getSheetByName("ドクターマスタ");
+  const masterMap = {};
+  const doctorTeamMap = {}; // 医師名からチーム名を引くマップ
+  if (masterSheet) {
+    const masterData = masterSheet.getDataRange().getValues();
+    for (let i = 1; i < masterData.length; i++) {
+      const docName = masterData[i][0] ? masterData[i][0].toString().trim() : "";
+      const accountId = masterData[i][1] ? masterData[i][1].toString().trim() : "";
+      const teamName = masterData[i][2] ? masterData[i][2].toString().trim() : "";
+      if (docName && accountId) {
+        masterMap[docName] = accountId;
+      }
+      if (docName && teamName) {
+        doctorTeamMap[docName] = teamName;
+      }
+    }
+  }
+
+  // ★追加：「設定」シートからチーム名と絵文字のマッピングを取得（A〜C列をカバー）
+  const configSheet = ss.getSheetByName("設定");
+  const teamEmojiMap = {};
+  if (configSheet) {
+    const configData = configSheet.getDataRange().getValues();
+    configData.forEach(row => {
+      let rowStr = row.map(v => v ? v.toString().trim() : "");
+      if (rowStr[0] && rowStr[1]) {
+        teamEmojiMap[rowStr[0]] = rowStr[1];
+      }
+      if (rowStr[0] && rowStr[2] && !teamEmojiMap[rowStr[0]]) {
+        teamEmojiMap[rowStr[0]] = rowStr[2];
+      }
+      if (rowStr[1] && rowStr[2] && !teamEmojiMap[rowStr[1]]) {
+        teamEmojiMap[rowStr[1]] = rowStr[2];
+      }
+    });
+  }
+
+  // カルーセル用の各バブルデータ格納コンテナ（順番：病院 ➔ 船橋 ➔ 西船 ➔ 市川）
+  const cardData = {
+    "船橋整形外科病院": { title: "🏥 船橋整形外科病院", color: "#e74c3c", ampm: { "回復/救急": [], "当直": [] }, hasRecords: false },
+    "船橋": { title: "🏥 船橋クリニック", color: "#2980b9", ampm: { "外来午前": [], "外来午後": [] }, hasRecords: false },
+    "西船": { title: "🏥 西船クリニック", color: "#2980b9", ampm: { "外来午前": [], "外来午後": [] }, hasRecords: false },
+    "市川": { title: "🏥 市川クリニック", color: "#2980b9", ampm: { "外来午前": [], "外来午後": [] }, hasRecords: false }
+  };
+
+  const locations = ["船橋", "市川", "西船"];
+  const bubbles = [];
+
+  // 前日・翌日の計算は全カード共通
+  const [tYear, tMonth, tDay] = targetDateStr.split('/').map(Number);
+  const prevD = new Date(tYear, tMonth - 1, tDay - 1);
+  const nextD = new Date(tYear, tMonth - 1, tDay + 1);
+  const prevDateStr = `${prevD.getFullYear()}/${String(prevD.getMonth()+1).padStart(2, '0')}/${String(prevD.getDate()).padStart(2, '0')}`;
+  const nextDateStr = `${nextD.getFullYear()}/${String(nextD.getMonth()+1).padStart(2, '0')}/${String(nextD.getDate()).padStart(2, '0')}`;
+
+  // 3拠点のシートから全データを走査・分類
+  locations.forEach(loc => {
+    const sheet = ss.getSheetByName(`スケジュール${loc}`);
+    if (!sheet) return;
+    
+    const data = sheet.getDataRange().getValues();
+    const records = data.slice(1).filter(row => {
+      if (!row[0]) return false;
+      const d = new Date(row[0]);
+      const dStr = `${d.getFullYear()}/${String(d.getMonth()+1).padStart(2, '0')}/${String(d.getDate()).padStart(2, '0')}`;
+      return dStr === targetDateStr;
+    });
+
+    records.forEach(row => {
+      const roleFull = row[2] ? row[2].toString() : "";
+      const rawDoctor = row[3] ? row[3].toString().trim() : "";
+      const doctorName = rawDoctor ? rawDoctor + " 先生" : "";
+
+      const parts = roleFull.split("_");
+      const category = parts[0];       
+      const detail = parts[1] || "";   
+
+      // ★追加：ドクターのチームから絵文字を特定する処理
+      let emoji = "";
+      if (doctorTeamMap[rawDoctor] && teamEmojiMap[doctorTeamMap[rawDoctor]]) {
+        emoji = teamEmojiMap[doctorTeamMap[rawDoctor]];
+      }
+
+      // ★変更：診察室（detail）の前に絵文字を合体
+      let textElement = {
+        type: "text",
+        text: `${emoji}${detail}：${doctorName}`,
+        size: "sm",
+        margin: "xs",
+        wrap: true
+      };
+
+      if (masterMap[rawDoctor]) {
+        textElement.text += " 💬"; 
+        textElement.color = "#0066cc"; 
+        textElement.action = {
+          type: "uri",
+          uri: `https://line.worksmobile.com/message/send?version=28&emailList=${masterMap[rawDoctor]}`
+        };
+      } else {
+        textElement.color = "#333333"; 
+      }
+
+      // ★変更：カテゴリに応じたカードへの振り分け
+      if (category === "回復/救急" || category === "当直") {
+        if (cardData["船橋整形外科病院"].ampm[category]) {
+          cardData["船橋整形外科病院"].ampm[category].push(textElement);
+          cardData["船橋整形外科病院"].hasRecords = true;
+        }
+      } else if (category === "外来午前" || category === "外来午後") {
+        if (cardData[loc] && cardData[loc].ampm[category]) {
+          cardData[loc].ampm[category].push(textElement);
+          cardData[loc].hasRecords = true;
+        }
+      }
+    });
+  });
+
+  // 指定の並び順通りにカルーセルのカード（バブル）を組み立て
+  const order = ["船橋整形外科病院", "船橋", "西船", "市川"];
+  
+  order.forEach(key => {
+    const cInfo = cardData[key];
+    let boxContents = [];
+
+    // カードのヘッダー（拠点名と日付）
+    boxContents.push({
+      type: "text",
+      text: cInfo.title,
+      weight: "bold",
+      size: "lg",
+      color: cInfo.color,
+      margin: "md"
+    });
+    boxContents.push({
+      type: "text",
+      text: `🕰️ ${displayDateStr}`,
+      weight: "bold",
+      size: "md",
+      color: "#2c3e50",
+      margin: "sm"
+    });
+
+    const addSection = (title, items) => {
+      if (items.length === 0) return;
+      boxContents.push({
+        type: "text",
+        text: title,
+        weight: "bold",
+        size: "sm",
+        margin: "lg",
+        color: "#34495e"
+      });
+      items.forEach(item => boxContents.push(item));
+    };
+
+    // カード特有のセクション追加
+    if (key === "船橋整形外科病院") {
+      addSection("🚑️回復/救急", cInfo.ampm["回復/救急"]);
+      addSection("🌙当直", cInfo.ampm["当直"]);
+
+      // 当直ドクターへの連絡用リンク（当直に登録がある場合のみ病院カードへ追加）
+      const touchokuLineId = PropertiesService.getScriptProperties().getProperty("TOUCHOKU_LINE");
+      if (touchokuLineId && cInfo.ampm["当直"].length > 0) {
+        boxContents.push({
+          type: "text",
+          text: "🟢当直ドクターへLINE💬",
+          size: "sm",
+          margin: "xs",
+          wrap: true,
+          color: "#0066cc",
+          action: {
+            type: "uri",
+            uri: `https://line.worksmobile.com/message/send?version=28&emailList=${touchokuLineId}`
+          }
+        });
+      }
+    } else {
+      addSection("🗒️外来午前", cInfo.ampm["外来午前"]);
+      addSection("📒外来午後", cInfo.ampm["外来午後"]);
+    }
+
+    if (!cInfo.hasRecords) {
+      boxContents.push({
+        type: "text",
+        text: `予定されているスケジュールはありません。`,
+        margin: "md",
+        wrap: true
+      });
+    }
+
+    // 区切り線
+    boxContents.push({ type: "separator", margin: "xl" });
+    
+    // 一覧へのリンクボタン
+    boxContents.push({
+      type: "button",
+      style: "link",
+      height: "sm",
+      action: {
+        type: "uri",
+        label: "📅外来スケジュール一覧",
+        uri: PropertiesService.getScriptProperties().getProperty("GAIRAI_URL")
+      },
+      margin: "md"
+    });
+
+    // 前日のスケジュールをリクエストするボタン
+    boxContents.push({
+      type: "button",
+      style: "secondary",
+      height: "sm",
+      action: {
+        type: "message",
+        label: "◀️前日の外来スケジュール",
+        text: `${prevDateStr}のスケジュール`, 
+        postback: `REQ_DATE:${prevDateStr}`
+      },
+      margin: "sm"
+    });
+
+    // 翌日のスケジュールをリクエストするボタン
+    boxContents.push({
+      type: "button",
+      style: "primary",
+      color: "#3498db",
+      height: "sm",
+      action: {
+        type: "message",
+        label: "翌日の外来スケジュール▶️",
+        text: `${nextDateStr}のスケジュール`, 
+        postback: `REQ_DATE:${nextDateStr}`
+      },
+      margin: "sm"
+    });
+
+    // バブルを配列に追加
+    bubbles.push({
+      type: "bubble",
+      size: "mega",
+      body: {
+        type: "box",
+        layout: "vertical",
+        contents: boxContents
+      }
+    });
+  });
+
+  return {
+    type: "flex",
+    altText: `${displayDateStr}の外来スケジュール`,
+    contents: {
+      type: "carousel",
+      contents: bubbles
+    }
+  };
+}
+
+// ＝＝＝＝＝ ここから下がLINE WORKS Bot連携用のコードです ＝＝＝＝＝
+
+function doPost(e) {
+  if (!e || !e.postData || !e.postData.contents) {
+    return ContentService.createTextOutput("OK");
+  }
+
+  try {
+    const props = PropertiesService.getScriptProperties().getProperties();
+    const json = JSON.parse(e.postData.contents);
+    const userId = json.source && json.source.userId ? json.source.userId : null;
+
+    if (userId) {
+      let targetDateStr = "";
+      
+      let userText = "";
+      if (json.content && json.content.type === "text") {
+        userText = json.content.text || "";
+      }
+      
+      let postbackData = "";
+      if (json.content && json.content.postback) {
+        postbackData = json.content.postback;
+        userText += postbackData;
+      }
+
+      let normalizedText = userText.replace(/[０-９]/g, function(s) {
+        return String.fromCharCode(s.charCodeAt(0) - 0xFEE0);
+      }).trim();
+
+      if (postbackData.startsWith("REQ_DATE:")) {
+        targetDateStr = postbackData.replace("REQ_DATE:", "");
+      } else if (/^\d{4}$/.test(normalizedText)) {
+        let jstYear = Utilities.formatDate(new Date(), "Asia/Tokyo", "yyyy");
+        let m = normalizedText.substring(0, 2);
+        let d = normalizedText.substring(2, 4);
+        targetDateStr = `${jstYear}/${m}/${d}`;
+      } else {
+        let targetDate = new Date();
+        if (userText.includes("明日")) {
+          targetDate.setDate(targetDate.getDate() + 1);
+        }
+        targetDateStr = Utilities.formatDate(targetDate, "Asia/Tokyo", "yyyy/MM/dd");
+      }
+      
+      const messageContent = generateScheduleMessage(targetDateStr);
+      sendLineWorksMessageToUser(props, userId, messageContent);
+    }
+  } catch (error) {
+    console.error("Webhook処理エラー: ", error.toString());
+  }
+
+  return ContentService.createTextOutput("OK");
+}
+
+function sendLineWorksMessageToUser(props, userId, contentObject) {
+  const accessToken = getAccessToken(props);
+  const url = "https://www.worksapis.com/v1.0/bots/" + props.BOT_ID + "/users/" + userId + "/messages";
+
+  const options = {
+    method: "post",
+    headers: {
+      Authorization: "Bearer " + accessToken,
+      "Content-Type": "application/json"
+    },
+    payload: JSON.stringify({
+      content: contentObject
+    }),
+    muteHttpExceptions: true
+  };
+
+  const response = UrlFetchApp.fetch(url, options);
+
+  if (response.getResponseCode() !== 201) {
+    throw new Error("Bot送信失敗: " + response.getContentText());
+  }
+}
+
+function repairPrivateKey(key) {
+  if (!key) return "";
+  const header = "-----BEGIN PRIVATE KEY-----";
+  const footer = "-----END PRIVATE KEY-----";
+  
+  let normalizedKey = key.replace(/\\n/g, '\n').replace(/\\r/g, '');
+  
+  if (normalizedKey.indexOf(header) !== -1 && normalizedKey.indexOf(footer) !== -1) {
+    let body = normalizedKey.substring(normalizedKey.indexOf(header) + header.length, normalizedKey.indexOf(footer));
+    body = body.replace(/\s+/g, ''); 
+    let formattedBody = body.match(/.{1,64}/g).join('\n');
+    return header + '\n' + formattedBody + '\n' + footer;
+  }
+  return key;
+}
+
+function getAccessToken(props) {
+  const privateKey = repairPrivateKey(props.PRIVATE_KEY);
+  const now = Math.floor(Date.now() / 1000);
+  const header = { alg: "RS256", typ: "JWT" };
+  const payload = {
+    iss: (props.CLIENT_ID || "").trim(),
+    sub: (props.SERVICE_ACCOUNT || "").trim(),
+    iat: now,
+    exp: now + 3600
+  };
+
+  const encodedHeader = Utilities.base64EncodeWebSafe(JSON.stringify(header));
+  const encodedPayload = Utilities.base64EncodeWebSafe(JSON.stringify(payload));
+  const signingInput = encodedHeader + "." + encodedPayload;
+  const signatureBytes = Utilities.computeRsaSha256Signature(signingInput, privateKey);
+  const encodedSignature = Utilities.base64EncodeWebSafe(signatureBytes);
+  const jwt = signingInput + "." + encodedSignature;
+
+  const response = UrlFetchApp.fetch(
+    "https://auth.worksmobile.com/oauth2/v2.0/token",
+    {
+      method: "post",
+      payload: {
+        assertion: jwt,
+        grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
+        client_id: (props.CLIENT_ID || "").trim(),
+        client_secret: (props.CLIENT_SECRET || "").trim(),
+        scope: "bot"
+      },
+      muteHttpExceptions: true
+    }
+  );
+
+  const text = response.getContentText();
+  if (!text.startsWith("{")) {
+    throw new Error("Token取得失敗: " + text);
+  }
+
+  const json = JSON.parse(text);
+  if (!json.access_token) {
+    throw new Error(text);
+  }
+
+  return json.access_token;
+}
