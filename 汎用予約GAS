@@ -12,7 +12,8 @@ const CONFIG = {
   PRIVATE_KEY: props.PRIVATE_KEY || "",
   BOT_ID: props.BOT_ID || "",
   SPREADSHEET_ID: props.SPREADSHEET_ID || "",
-  CALENDAR_ID: props.CALENDAR_ID || "" // 【追加】GoogleカレンダーID
+  CALENDAR_ID: props.CALENDAR_ID || "", // 【追加】GoogleカレンダーID
+  PUBLIC_CALENDAR_URL: props.PUBLIC_CALENDAR_URL || "" // 【新機能】公開カレンダーURL
 };
 
 // ==========================================
@@ -133,11 +134,38 @@ function doPost(e) {
       const cache = CacheService.getScriptCache();
       const userEmail = getUserEmail(userId); // 広報メンバー特定用にも先にメアドを取得
       
+      // 【新機能】管理画面呼び出し判定
+      const ss = getTargetSpreadsheet();
+      const settingSheet = ss.getSheetByName("設定");
+      let isAdminCommand = false;
+      if (settingSheet) {
+        const sLastRow = settingSheet.getLastRow();
+        if (sLastRow >= 5) {
+          const adminWords = settingSheet.getRange(5, 9, sLastRow - 4, 1).getValues().flat().filter(String);
+          if (adminWords.includes(text)) {
+            isAdminCommand = true;
+          }
+        }
+      }
+
+      if (isAdminCommand) {
+        sendAdminDashboard(userId);
+        return ContentService.createTextOutput("OK");
+      }
+      
+      // 【追加】管理画面からのドクター一覧呼び出し（テキスト発言版）
+      // 全角スペース、半角スペースどちらでも対応できるように正規表現でマッチさせます
+      const progressMatch = text.match(/^進捗：(.+?)[\s ]+(.+?)[\s ]+一覧$/);
+      if (progressMatch) {
+        sendAdminDoctorList(userId, progressMatch[2], progressMatch[1]);
+        return ContentService.createTextOutput("OK");
+      }
+
       const pendingTargetId = cache.get('wait_comment_' + userId);
       const pendingPrTargetId = cache.get('wait_pr_comment_' + userEmail);
       
       // システムコマンド判定用
-      const isSystemCommand = text === "" || text === "はい" || text === "いいえ" || text === "キャンセル" || text.startsWith("予約 ") || /^\d{4}\/\d{2}\/\d{2}$/.test(text) || /^\d{4}\/\d{2}\/\d{2}\s\d{2}:\d{2}\s-\s\d{2}:\d{2}$/.test(text);
+      const isSystemCommand = text === "" || text === "はい" || text === "いいえ" || text === "キャンセル" || text.startsWith("予約 ") || text.startsWith("進捗：") || /^\d{4}\/\d{2}\/\d{2}$/.test(text) || /^\d{4}\/\d{2}\/\d{2}\s\d{2}:\d{2}\s-\s\d{2}:\d{2}$/.test(text);
 
       // 【1】ドクター自身のコメント入力待ちの場合
       if (pendingTargetId && !isSystemCommand) {
@@ -272,27 +300,36 @@ function updateReservationComment(targetId, comment) {
       if (CONFIG.CALENDAR_ID) {
         try {
           const cal = CalendarApp.getCalendarById(CONFIG.CALENDAR_ID);
-          if (cal) {
-            let dObj = rData[i][1] instanceof Date ? rData[i][1] : new Date(rData[i][1]);
-            let dateStr = Utilities.formatDate(dObj, "Asia/Tokyo", "yyyy/MM/dd");
-            let stStr = rData[i][2] instanceof Date ? Utilities.formatDate(rData[i][2], "Asia/Tokyo", "HH:mm") : rData[i][2];
-            let etStr = rData[i][3] instanceof Date ? Utilities.formatDate(rData[i][3], "Asia/Tokyo", "HH:mm") : rData[i][3];
-            let startDateTime = new Date(dateStr + " " + stStr);
-            let endDateTime = new Date(dateStr + " " + etStr);
-            let doctorName = rData[i][5];
-            let remark = rData[i][8] || "(未入力)";
+          if (!cal) throw new Error("指定されたカレンダーIDが見つかりません。スクリプトプロパティをご確認ください。");
+          
+          let dObj = rData[i][1] instanceof Date ? rData[i][1] : new Date(rData[i][1]);
+          let dateStr = Utilities.formatDate(dObj, "Asia/Tokyo", "yyyy/MM/dd");
+          let stStr = rData[i][2] instanceof Date ? Utilities.formatDate(rData[i][2], "Asia/Tokyo", "HH:mm") : rData[i][2];
+          let etStr = rData[i][3] instanceof Date ? Utilities.formatDate(rData[i][3], "Asia/Tokyo", "HH:mm") : rData[i][3];
+          
+          // 日時を完全にパースして安全に生成
+          let dP = dateStr.split("/");
+          let sP = stStr.split(":");
+          let eP = etStr.split(":");
+          let startDateTime = new Date(dP[0], dP[1]-1, dP[2], sP[0], sP[1]);
+          let endDateTime = new Date(dP[0], dP[1]-1, dP[2], eP[0], eP[1]);
+          
+          let doctorName = rData[i][5];
+          let remark = rData[i][8] || "(未入力)";
 
-            let events = cal.getEvents(startDateTime, endDateTime);
-            for (let ev of events) {
-              if (ev.getTitle().indexOf(doctorName) !== -1) {
-                ev.setDescription(`対象者: ${targetLineId}\n担当医: ${doctorName}\n\n【コメント】\n${comment}\n\n【備考】\n${remark}`);
-                break;
-              }
+          let events = cal.getEvents(startDateTime, endDateTime);
+          for (let ev of events) {
+            if (ev.getTitle().indexOf(doctorName) !== -1) {
+              ev.setDescription(`対象者: ${targetLineId}\n担当医: ${doctorName}\n\n【コメント】\n${comment}\n\n【備考】\n${remark}`);
+              break;
             }
           }
         } catch(e) {
           console.error("カレンダー更新エラー: " + e.message);
+          sendErrorNotifyToPR("コメント追加時のカレンダー更新エラー\n" + e.message);
         }
+      } else {
+         sendErrorNotifyToPR("コメント追加時のカレンダー更新エラー\nスクリプトプロパティの CALENDAR_ID が未設定です。");
       }
       break;
     }
@@ -328,27 +365,36 @@ function updateReservationRemark(targetId, appendText) {
       if (CONFIG.CALENDAR_ID) {
         try {
           const cal = CalendarApp.getCalendarById(CONFIG.CALENDAR_ID);
-          if (cal) {
-            let dObj = rData[i][1] instanceof Date ? rData[i][1] : new Date(rData[i][1]);
-            let dateStr = Utilities.formatDate(dObj, "Asia/Tokyo", "yyyy/MM/dd");
-            let stStr = rData[i][2] instanceof Date ? Utilities.formatDate(rData[i][2], "Asia/Tokyo", "HH:mm") : rData[i][2];
-            let etStr = rData[i][3] instanceof Date ? Utilities.formatDate(rData[i][3], "Asia/Tokyo", "HH:mm") : rData[i][3];
-            let startDateTime = new Date(dateStr + " " + stStr);
-            let endDateTime = new Date(dateStr + " " + etStr);
-            let doctorName = rData[i][5];
-            let comment = rData[i][7] || "(未入力)";
+          if (!cal) throw new Error("指定されたカレンダーIDが見つかりません。スクリプトプロパティをご確認ください。");
+          
+          let dObj = rData[i][1] instanceof Date ? rData[i][1] : new Date(rData[i][1]);
+          let dateStr = Utilities.formatDate(dObj, "Asia/Tokyo", "yyyy/MM/dd");
+          let stStr = rData[i][2] instanceof Date ? Utilities.formatDate(rData[i][2], "Asia/Tokyo", "HH:mm") : rData[i][2];
+          let etStr = rData[i][3] instanceof Date ? Utilities.formatDate(rData[i][3], "Asia/Tokyo", "HH:mm") : rData[i][3];
+          
+          // 日時を完全にパースして安全に生成
+          let dP = dateStr.split("/");
+          let sP = stStr.split(":");
+          let eP = etStr.split(":");
+          let startDateTime = new Date(dP[0], dP[1]-1, dP[2], sP[0], sP[1]);
+          let endDateTime = new Date(dP[0], dP[1]-1, dP[2], eP[0], eP[1]);
+          
+          let doctorName = rData[i][5];
+          let commentVal = rData[i][7] || "(未入力)";
 
-            let events = cal.getEvents(startDateTime, endDateTime);
-            for (let ev of events) {
-              if (ev.getTitle().indexOf(doctorName) !== -1) {
-                ev.setDescription(`対象者: ${targetLineId}\n担当医: ${doctorName}\n\n【コメント】\n${comment}\n\n【備考】\n${newVal}`);
-                break;
-              }
+          let events = cal.getEvents(startDateTime, endDateTime);
+          for (let ev of events) {
+            if (ev.getTitle().indexOf(doctorName) !== -1) {
+              ev.setDescription(`対象者: ${targetLineId}\n担当医: ${doctorName}\n\n【コメント】\n${commentVal}\n\n【備考】\n${newVal}`);
+              break;
             }
           }
         } catch(e) {
           console.error("カレンダー更新エラー: " + e.message);
+          sendErrorNotifyToPR("備考追加時のカレンダー更新エラー\n" + e.message);
         }
+      } else {
+         sendErrorNotifyToPR("備考追加時のカレンダー更新エラー\nスクリプトプロパティの CALENDAR_ID が未設定です。");
       }
       
       // ドクターマスタのK列にも反映
@@ -682,6 +728,10 @@ function processPostback(userId, postbackData) {
   // 確認メッセージで「はい」が押された場合、予約確定処理へ ※現在はmessage発言で拾うため使われませんが、念のため維持
   } else if (params.action === "reserve" && params.id) {
     executeReservation(userId, parseInt(params.id, 10));
+    
+  // 【新機能】管理画面からのドクター一覧呼び出し ※現在はmessage発言に変更したため使われませんが、念のため維持
+  } else if (params.action === "admin_list" && params.s && params.c) {
+    sendAdminDoctorList(userId, params.s, params.c);
   }
 }
 
@@ -853,17 +903,26 @@ function executeReservation(userId, targetId) {
   if (CONFIG.CALENDAR_ID) {
     try {
       const cal = CalendarApp.getCalendarById(CONFIG.CALENDAR_ID);
-      if (cal) {
-        const timeParts = reservedSlotInfo.time.split(" - ");
-        const startDateTime = new Date(reservedSlotInfo.date + " " + timeParts[0]);
-        const endDateTime = new Date(reservedSlotInfo.date + " " + timeParts[1]);
-        const title = `[ｲﾝﾀﾋﾞｭｰ] ${doctorName} 様`;
-        const description = `対象者: ${userEmail}\n担当医: ${doctorName}\n\n【コメント】\n(未入力)\n\n【備考】\n(未入力)`;
-        cal.createEvent(title, startDateTime, endDateTime, { description: description });
-      }
+      if (!cal) throw new Error("指定されたカレンダーIDが見つかりません。スクリプトプロパティをご確認ください。");
+      
+      // 日付を「年」「月」「日」に完全に分けて安全にパース
+      const dateParts = reservedSlotInfo.date.split("/");
+      const timeParts = reservedSlotInfo.time.split(" - ");
+      const stParts = timeParts[0].split(":");
+      const etParts = timeParts[1].split(":");
+      
+      const startDateTime = new Date(dateParts[0], dateParts[1] - 1, dateParts[2], stParts[0], stParts[1]);
+      const endDateTime = new Date(dateParts[0], dateParts[1] - 1, dateParts[2], etParts[0], etParts[1]);
+      
+      const title = `[予] ${doctorName} 様`;
+      const description = `対象者: ${userEmail}\nお名前: ${doctorName}\n\n【コメント】\n(未入力)\n\n【備考】\n(未入力)`;
+      cal.createEvent(title, startDateTime, endDateTime, { description: description });
     } catch(e) {
       console.error("カレンダー登録エラー: " + e.message);
+      sendErrorNotifyToPR("予約時のカレンダー登録エラー\n" + e.message);
     }
+  } else {
+    sendErrorNotifyToPR("予約時のカレンダー登録エラー\nスクリプトプロパティの CALENDAR_ID が未設定です。");
   }
   
   // ドクター本人のコメント受け取り用に一時的にステータスをキャッシュ（1時間有効）
@@ -1186,4 +1245,222 @@ function updateAdminDashboard() {
   });
   
   adminSheet.getRange(1, 6, aggArray.length, aggArray[0].length).setValues(aggArray);
+}
+
+// ==========================================
+// 12. 広報メンバーへのエラー通知機能（追加）
+// ==========================================
+function sendErrorNotifyToPR(errorMessage) {
+  try {
+    const ss = getTargetSpreadsheet();
+    const settingSheet = ss.getSheetByName("設定");
+    if (settingSheet) {
+      const sLastRow = settingSheet.getLastRow();
+      if (sLastRow >= 5) {
+        const notifyTargets = settingSheet.getRange(5, 2, sLastRow - 4, 1).getValues().flat().filter(String);
+        if (notifyTargets.length > 0) {
+          const notifyContent = {
+            "type": "text",
+            "text": `【システムエラー通知】\nGoogleカレンダー連携でエラーが発生しました。\n\n詳細:\n${errorMessage}\n\n※このメッセージは設定シートの通知先メンバー全員に送信されています。\n※もし「Authorization is required」や「権限が必要です」といったエラーが出た場合は、GASのエディタ画面で適当な関数（generateReservationSlotsなど）を一度手動で『実行』し、Googleアカウントへのアクセス承認を完了させてください。`
+          };
+          notifyTargets.forEach(function(targetId) {
+            if (targetId.trim() !== "") {
+              sendWorksMessage(targetId.trim(), notifyContent);
+            }
+          });
+        }
+      }
+    }
+  } catch(e) {
+    console.error("エラー通知の送信に失敗: " + e.message);
+  }
+}
+
+// ==========================================
+// 13. 【追加】カレンダー認証用ダミー関数
+// ==========================================
+function authCalendar() {
+  CalendarApp.getAllCalendars();
+}
+
+// ==========================================
+// 14. 【新機能】管理画面Flexメッセージ送信
+// ==========================================
+function sendAdminDashboard(userId) {
+  const ss = getTargetSpreadsheet();
+  const settingSheet = ss.getSheetByName("設定");
+  const adminSheet = ss.getSheetByName("管理画面");
+
+  // 絵文字のマッピング作成 (F列とG列)
+  const emojiMap = {};
+  if (settingSheet) {
+    const sLastRow = settingSheet.getLastRow();
+    if (sLastRow >= 5) {
+      const centerData = settingSheet.getRange(5, 6, sLastRow - 4, 2).getValues();
+      centerData.forEach(row => {
+        if (row[0]) emojiMap[row[0]] = row[1] || "";
+      });
+    }
+  }
+
+  if (!adminSheet) return;
+
+  // 管理画面のF1からのデータを動的に取得
+  const rawAggData = adminSheet.getRange(1, 6, 6, 20).getValues(); 
+  const centers = rawAggData[0].slice(1).filter(String);
+  if (centers.length === 0) {
+    sendWorksMessage(userId, { type: "text", text: "管理画面のデータがまだ生成されていません。" });
+    return;
+  }
+  
+  const numCols = centers.length + 1;
+  const aggData = adminSheet.getRange(1, 6, 6, numCols).getValues();
+  
+  const flexContents = [];
+
+  // ヘッダー行：alignItems: "flex-end" で下揃えにし、「状態」とセンター名の底辺を揃える
+  let headerBox = { type: "box", layout: "horizontal", alignItems: "flex-end", contents: [] };
+  
+  // flexを3にして、横幅のバランスを均等化
+  headerBox.contents.push({ type: "text", text: "状態", weight: "bold", size: "xs", flex: 3, align: "start" });
+  
+  centers.forEach(c => {
+    let e = emojiMap[c] || "";
+    // 絵文字とテキストを分離し、数字部分と同じ「垂直Box」構造にして縦のラインを完璧に揃える
+    headerBox.contents.push({
+      type: "box",
+      layout: "vertical",
+      flex: 3, // 幅を広げて「総合・専門」を入りやすくする
+      alignItems: "center",
+      contents: [
+        { type: "text", text: e, size: "xs", align: "center", margin: "none" },
+        // wrap: false と shrink-to-fit で強制的に1行に収める
+        { type: "text", text: c, weight: "bold", size: "xxs", align: "center", wrap: false, adjustMode: "shrink-to-fit", margin: "sm" }
+      ]
+    });
+  });
+  flexContents.push(headerBox);
+  flexContents.push({ type: "separator", margin: "md" });
+
+  // データ行（2行目以降）
+  for (let r = 1; r < aggData.length; r++) {
+    // 行全体を alignItems: "center" にして高さの中央を揃える
+    let rowBox = { type: "box", layout: "horizontal", margin: "md", alignItems: "center", contents: [] };
+    let statusName = aggData[r][0];
+    
+    // ヘッダーに合わせて flex: 3 に統一
+    rowBox.contents.push({ type: "text", text: statusName, size: "xs", flex: 3, color: "#666666", align: "start" });
+
+    for (let c = 1; c < aggData[r].length; c++) {
+      let count = aggData[r][c] || 0;
+      let centerName = centers[c-1];
+      
+      let cellBox = {
+        type: "box",
+        layout: "vertical",
+        flex: 3, // ヘッダーに合わせて flex: 3 に統一
+        alignItems: "center",
+        justifyContent: "center",
+        contents: [
+          {
+            type: "text",
+            text: count.toString(),
+            size: "sm",
+            align: "center", // 【修正】ここを追加！数字テキスト自体を中央揃えにして縦ラインを合わせる
+            weight: count > 0 ? "bold" : "regular",
+            color: count > 0 ? "#036ce1" : "#aaaaaa"
+          }
+        ]
+      };
+      
+      if (count > 0) {
+        cellBox.action = {
+          type: "message",
+          label: "一覧表示",
+          text: `進捗：${centerName} ${statusName} 一覧`
+        };
+      }
+      rowBox.contents.push(cellBox);
+    }
+    flexContents.push(rowBox);
+  }
+
+  const bubble = {
+    type: "bubble",
+    size: "giga", 
+    body: {
+      type: "box",
+      layout: "vertical",
+      contents: [
+        { type: "text", text: "📊 管理画面 (進捗状況)", weight: "bold", size: "md" },
+        { type: "text", text: "※青い数字をタップすると医師名が表示されます", size: "xxs", color: "#aaaaaa", margin: "sm" },
+        { type: "separator", margin: "md" },
+        ...flexContents
+      ]
+    }
+  };
+
+  if (CONFIG.PUBLIC_CALENDAR_URL) {
+    bubble.footer = {
+      type: "box",
+      layout: "vertical",
+      contents: [
+        {
+          type: "button",
+          style: "primary",
+          action: {
+            type: "uri",
+            label: "公開カレンダーを見る",
+            uri: CONFIG.PUBLIC_CALENDAR_URL
+          }
+        }
+      ]
+    };
+  }
+
+  sendWorksMessage(userId, { type: "flex", altText: "管理画面の表示", contents: bubble });
+}
+// ==========================================
+// 15. 【新機能】管理画面からのドクター一覧送信
+// ==========================================
+function sendAdminDoctorList(userId, targetStatus, targetCenter) {
+  const ss = getTargetSpreadsheet();
+  const masterSheet = ss.getSheetByName("ドクターマスタ");
+  if (!masterSheet) return;
+
+  const mData = masterSheet.getDataRange().getValues();
+  const matchDoctors = [];
+
+  for (let j = 1; j < mData.length; j++) {
+    let row = mData[j];
+    let center = row[0] || "不明";
+    let docName = row[1];
+    if (!docName) continue;
+
+    if (center !== targetCenter) continue;
+
+    let isRes = row[5] === "済"; // F列
+    let isInt = row[6] === "済"; // G列
+    let isEdi = row[7] === "済"; // H列
+    let isPub = row[8] === "済"; // I列
+
+    let status = "未予約";
+    if (isPub) status = "公開済み";
+    else if (isEdi) status = "編集済み";
+    else if (isInt) status = "ｲﾝﾀﾋﾞｭｰ済";
+    else if (isRes) status = "予約済";
+
+    if (status === targetStatus) {
+      matchDoctors.push(docName);
+    }
+  }
+
+  let text = `【${targetCenter} - ${targetStatus}】\n`;
+  if (matchDoctors.length > 0) {
+    text += "・" + matchDoctors.join("\n・");
+  } else {
+    text += "該当する医師はいません。";
+  }
+
+  sendWorksMessage(userId, { type: "text", text: text });
 }
