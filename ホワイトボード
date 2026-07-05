@@ -1,0 +1,386 @@
+// スクリプトプロパティを取得する準備
+const props = PropertiesService.getScriptProperties();
+
+/**
+ * LINE WORKSからのWebhookを受け取るメイン関数
+ */
+function doPost(e) {
+  // LINE WORKSからのデータが空の場合は即座に終了
+  if (!e || !e.postData || !e.postData.contents) {
+    return ContentService.createTextOutput(JSON.stringify({ status: 'ok' })).setMimeType(ContentService.MimeType.JSON);
+  }
+
+  try {
+    const jsonString = e.postData.contents;
+    const data = JSON.parse(jsonString);
+    
+    // LINE WORKS API 2.0のペイロードからユーザーIDを取得
+    const userId = data.source && data.source.userId ? data.source.userId : null;
+    
+    if (!userId) {
+      return ContentService.createTextOutput(JSON.stringify({ status: 'ok' })).setMimeType(ContentService.MimeType.JSON);
+    }
+    
+    // 先にLINE WORKS API 2.0のアクセストークンを自動生成しておく
+    const accessToken = getAccessToken();
+    
+    // -----------------------------------------------------------------
+    // 1. テキストメッセージが送信された場合（カルーセル表示）
+    // -----------------------------------------------------------------
+    if (data.type === 'message' && data.content && data.content.type === 'text') {
+      // ★修正：Flex Messageのボタン(message action)からの隠しデータ(postback)がある場合は保存処理へ
+      if (data.content.postback) {
+        processPostback(userId, data.content.postback, accessToken);
+      } else {
+        sendWardCarousel(userId, accessToken);
+      }
+    }
+    
+    // -----------------------------------------------------------------
+    // 2. 画像が送信された場合（確認ボタンを表示して事故を防ぐ）
+    // ※確実にキャッチできるよう、fileIdを持つメッセージを判定
+    // -----------------------------------------------------------------
+    else if (data.type === 'message' && data.content && (data.content.type === 'image' || data.content.fileId)) {
+      const fileId = data.content.fileId;
+      if (fileId) {
+        sendWardSelectionButtons(userId, fileId, accessToken);
+      }
+    }
+    
+    // -----------------------------------------------------------------
+    // 3. ボタン（Postback）が押された場合（保存と古いファイルの削除処理）
+    // -----------------------------------------------------------------
+    else if (data.type === 'postback' && data.data) {
+      processPostback(userId, data.data, accessToken);
+    }
+    
+    return ContentService.createTextOutput(JSON.stringify({ status: 'ok' })).setMimeType(ContentService.MimeType.JSON);
+    
+  } catch (error) {
+    console.error('エラーが発生しました: ' + error.toString());
+    return ContentService.createTextOutput(JSON.stringify({ status: 'error', message: error.toString() })).setMimeType(ContentService.MimeType.JSON);
+  }
+}
+
+/**
+ * 【表示機能】4病棟の画像をカルーセル（横スライド）で送信する
+ */
+function sendWardCarousel(userId, accessToken) {
+  const WARD_NAMES = ['回復期病棟', '１階病棟', '東病棟', '西病棟'];
+  const FOLDER_IDS = {
+    '回復期病棟': props.getProperty('FOLDER_ID_0'),
+    '１階病棟': props.getProperty('FOLDER_ID_1'),
+    '東病棟': props.getProperty('FOLDER_ID_2'),
+    '西病棟': props.getProperty('FOLDER_ID_3')
+  };
+
+  let carouselContents = [];
+
+  WARD_NAMES.forEach(ward => {
+    const folderId = FOLDER_IDS[ward];
+    const folder = DriveApp.getFolderById(folderId);
+    const files = folder.getFilesByName(ward + '_最新.jpg');
+    
+    // デフォルト画像
+    let imageUrl = 'https://dummyimage.com/600x400/cccccc/000000.png&text=No+Image'; 
+    let fileIdForLink = '';
+
+    if (files.hasNext()) {
+      const file = files.next();
+      fileIdForLink = file.getId();
+      // ドライブの画像をプレビュー表示するためのURL
+      imageUrl = 'https://drive.google.com/uc?export=view&id=' + fileIdForLink; 
+    }
+
+    carouselContents.push({
+      "type": "bubble",
+      "hero": {
+        "type": "image",
+        "url": imageUrl,
+        "size": "full",
+        "aspectRatio": "20:13",
+        "aspectMode": "cover"
+      },
+      "body": {
+        "type": "box",
+        "layout": "vertical",
+        "contents": [
+          { "type": "text", "text": ward, "weight": "bold", "size": "xl" }
+        ]
+      },
+      "footer": {
+        "type": "box",
+        "layout": "vertical",
+        "contents": [
+          {
+            "type": "button",
+            "action": {
+              "type": "uri",
+              "label": "画像を拡大して見る",
+              // 万が一プレビューが表示されない時のための直リンク
+              "uri": fileIdForLink ? "https://drive.google.com/file/d/" + fileIdForLink + "/view" : "https://drive.google.com/"
+            }
+          }
+        ]
+      }
+    });
+  });
+
+  const payload = {
+    content: {
+      type: "flex",
+      altText: "各病棟のホワイトボード状況",
+      contents: {
+        type: "carousel",
+        contents: carouselContents
+      }
+    }
+  };
+  
+  sendMessagePayload(userId, payload, accessToken);
+}
+
+/**
+ * 【確認機能】画像受信時に、どの病棟に保存するかを選択させるボタンを送信する
+ */
+function sendWardSelectionButtons(userId, fileId, accessToken) {
+  // ★確実に表示されるFlex Message形式に変更し、データ文字化け対策としてID(0~3)を送信
+  const payload = {
+    content: {
+      type: "flex",
+      altText: "病棟の選択",
+      contents: {
+        type: "bubble",
+        body: {
+          type: "box",
+          layout: "vertical",
+          contents: [
+            {
+              type: "text",
+              text: "画像を受信しました。\nどの病棟のホワイトボードですか？\n※選択すると上書きされます",
+              wrap: true,
+              weight: "bold",
+              size: "sm"
+            },
+            {
+              type: "button",
+              style: "primary",
+              margin: "md",
+              // ★修正：Flex Messageではpostback actionではなくmessage action(postback付き)を使用する
+              action: { type: "message", label: "回復期病棟", text: "回復期病棟", postback: "ward=0&fileId=" + fileId }
+            },
+            {
+              type: "button",
+              style: "primary",
+              margin: "sm",
+              action: { type: "message", label: "１階病棟", text: "１階病棟", postback: "ward=1&fileId=" + fileId }
+            },
+            {
+              type: "button",
+              style: "primary",
+              margin: "sm",
+              action: { type: "message", label: "東病棟", text: "東病棟", postback: "ward=2&fileId=" + fileId }
+            },
+            {
+              type: "button",
+              style: "primary",
+              margin: "sm",
+              action: { type: "message", label: "西病棟", text: "西病棟", postback: "ward=3&fileId=" + fileId }
+            }
+          ]
+        }
+      }
+    }
+  };
+  sendMessagePayload(userId, payload, accessToken);
+}
+
+/**
+ * 【保存機能】ボタンが押された時の処理（ダウンロード、削除、保存）
+ */
+function processPostback(userId, postbackData, accessToken) {
+  // dataの文字列（例: "ward=0&fileId=xxxxx"）をパースする
+  const params = {};
+  postbackData.split('&').forEach(pair => {
+    const [key, value] = pair.split('=');
+    params[key] = decodeURIComponent(value);
+  });
+  
+  let targetWard = params['ward'];
+  const fileId = params['fileId'];
+  
+  // ★安全のため数字で受け取ったデータを元の病棟名に変換
+  const wardMap = {
+    '0': '回復期病棟',
+    '1': '１階病棟',
+    '2': '東病棟',
+    '3': '西病棟'
+  };
+  if (wardMap[targetWard]) {
+    targetWard = wardMap[targetWard];
+  }
+  
+  const FOLDER_IDS = {
+    '回復期病棟': props.getProperty('FOLDER_ID_0'),
+    '１階病棟': props.getProperty('FOLDER_ID_1'),
+    '東病棟': props.getProperty('FOLDER_ID_2'),
+    '西病棟': props.getProperty('FOLDER_ID_3')
+  };
+  
+  const folderId = FOLDER_IDS[targetWard];
+  
+  if (targetWard && folderId && fileId) {
+    // LINE WORKSから画像のバイナリデータを取得
+    const imageBlob = downloadLineWorksAttachment(fileId, accessToken);
+    
+    if (imageBlob) {
+      const fileName = targetWard + '_最新.jpg';
+      imageBlob.setName(fileName);
+      
+      // 既存の古いファイルを削除して、新しいファイルを保存する
+      saveLatestImageAndSaveSpace(folderId, imageBlob, fileName);
+      
+      sendMessagePayload(userId, { content: { type: "text", text: targetWard + "のホワイトボード写真を更新しました！古い写真は削除されました。" } }, accessToken);
+    } else {
+      sendMessagePayload(userId, { content: { type: "text", text: "画像のダウンロードに失敗しました。もう一度お試しください。" } }, accessToken);
+    }
+  }
+}
+
+/**
+ * プライベートキーの改行コードやスペースの歪みを自動修復する関数
+ */
+function repairPrivateKey(key) {
+  if (!key) return "";
+  const header = "-----BEGIN PRIVATE KEY-----";
+  const footer = "-----END PRIVATE KEY-----";
+  
+  let normalizedKey = key.replace(/\\n/g, '\n').replace(/\\r/g, '');
+  
+  if (normalizedKey.indexOf(header) !== -1 && normalizedKey.indexOf(footer) !== -1) {
+    let body = normalizedKey.substring(normalizedKey.indexOf(header) + header.length, normalizedKey.indexOf(footer));
+    body = body.replace(/\s+/g, ''); 
+    let formattedBody = body.match(/.{1,64}/g).join('\n');
+    return header + '\n' + formattedBody + '\n' + footer;
+  }
+  return key;
+}
+
+/**
+ * LINE WORKSのAPI 2.0を使用してアクセストークン（JWT認証）を生成する
+ */
+function getAccessToken() {
+  const clientId = props.getProperty('CLIENT_ID');
+  const clientSecret = props.getProperty('CLIENT_SECRET');
+  const serviceAccount = props.getProperty('SERVICE_ACCOUNT');
+  // 成功コードの修復ロジックを適用
+  const privateKey = repairPrivateKey(props.getProperty('PRIVATE_KEY')); 
+  
+  const header = {
+    alg: 'RS256',
+    typ: 'JWT'
+  };
+  
+  const now = Math.floor(Date.now() / 1000);
+  const claim = {
+    iss: clientId,
+    sub: serviceAccount,
+    iat: now,
+    exp: now + 3600 // 1時間有効
+  };
+  
+  const signatureInput = Utilities.base64EncodeWebSafe(JSON.stringify(header)) + '.' + Utilities.base64EncodeWebSafe(JSON.stringify(claim));
+  const signature = Utilities.computeRsaSha256Signature(signatureInput, privateKey);
+  const jwt = signatureInput + '.' + Utilities.base64EncodeWebSafe(signature);
+  
+  const url = 'https://auth.worksmobile.com/oauth2/v2.0/token';
+  const payload = {
+    assertion: jwt,
+    grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+    client_id: clientId,
+    client_secret: clientSecret,
+    scope: 'bot'
+  };
+  
+  const options = {
+    method: 'post',
+    payload: payload
+  };
+  
+  const response = UrlFetchApp.fetch(url, options);
+  const json = JSON.parse(response.getContentText());
+  return json.access_token;
+}
+
+/**
+ * LINE WORKSのAPIから添付ファイル（画像）をダウンロードする
+ */
+function downloadLineWorksAttachment(fileId, accessToken) {
+  const botId = props.getProperty('BOT_ID');
+  // ★API 2.0の正しいURLへ修正しました
+  const url = 'https://www.worksapis.com/v1.0/bots/' + botId + '/attachments/' + fileId;
+  
+  const options = {
+    method: 'get',
+    headers: {
+      'Authorization': 'Bearer ' + accessToken
+    },
+    muteHttpExceptions: true
+  };
+  
+  const response = UrlFetchApp.fetch(url, options);
+  const responseCode = response.getResponseCode();
+  
+  if (responseCode === 200) {
+    return response.getBlob();
+  } else {
+    console.error('ファイルダウンロード失敗: ' + response.getContentText());
+    return null;
+  }
+}
+
+/**
+ * 古いファイルを削除（ゴミ箱へ移動）し、新しいファイルを保存するコアロジック
+ */
+function saveLatestImageAndSaveSpace(folderId, newBlob, fileName) {
+  const folder = DriveApp.getFolderById(folderId);
+  
+  // フォルダ内の同名ファイルを検索（過去の最新画像を探す）
+  const files = folder.getFilesByName(fileName);
+  
+  while (files.hasNext()) {
+    const file = files.next();
+    file.setTrashed(true); // ゴミ箱へ移動
+    console.log('古いファイルをゴミ箱に移動しました: ' + file.getName());
+  }
+  
+  // 新しいファイルを保存
+  const newFile = folder.createFile(newBlob);
+  console.log('新しいファイルを保存しました: ' + newFile.getName());
+}
+
+/**
+ * 汎用的にメッセージ（Payload）を送信する関数
+ */
+function sendMessagePayload(userId, payload, accessToken) {
+  const botId = props.getProperty('BOT_ID');
+  // ★API 2.0の正しいURLへ修正しました
+  const url = 'https://www.worksapis.com/v1.0/bots/' + botId + '/users/' + userId + '/messages';
+  
+  const options = {
+    method: 'post',
+    contentType: 'application/json',
+    headers: {
+      'Authorization': 'Bearer ' + accessToken
+    },
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  };
+  
+  const response = UrlFetchApp.fetch(url, options);
+  
+  // ★もし送信に失敗した場合はGASのログにエラー内容を出力するように修正しました
+  if (response.getResponseCode() !== 200 && response.getResponseCode() !== 201) {
+    console.error('Bot送信失敗: ' + response.getContentText());
+  }
+}
