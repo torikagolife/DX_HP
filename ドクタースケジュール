@@ -262,20 +262,58 @@ function generateScheduleMessage(targetDateStr) {
       addSection("🚑️回復/救急", cInfo.ampm["回復/救急"]);
       addSection("🌙当直", cInfo.ampm["当直"]);
 
-      // 当直ドクターへの連絡用リンク（当直に登録がある場合のみ病院カードへ追加）
+      // ★変更箇所：当直ドクターへの連絡用リンク（LINEと電話アイコンを横並びに配置）
       const touchokuLineId = PropertiesService.getScriptProperties().getProperty("TOUCHOKU_LINE");
-      if (touchokuLineId && cInfo.ampm["当直"].length > 0) {
-        boxContents.push({
+      const touchokuTell = PropertiesService.getScriptProperties().getProperty("TOUCHOKU_TELL");
+      
+      if ((touchokuLineId || touchokuTell) && cInfo.ampm["当直"].length > 0) {
+        let touchokuContents = [];
+        
+        // ベースのテキスト
+        touchokuContents.push({
           type: "text",
-          text: "🟢当直ドクターへLINE💬",
+          text: "🟢当直ドクタースマホ",
           size: "sm",
+          color: "#333333",
+          flex: 0, // アイコンと詰めて配置するための設定
+          gravity: "center"
+        });
+
+        // LINEアイコン（トークへのリンク）
+        if (touchokuLineId) {
+          touchokuContents.push({
+            type: "text",
+            text: " 💬",
+            size: "lg",
+            action: {
+              type: "uri",
+              uri: `https://line.worksmobile.com/message/send?version=28&emailList=${touchokuLineId}`
+            },
+            flex: 0,
+            gravity: "center"
+          });
+        }
+
+        // 電話アイコン（電話発信へのリンク）
+        if (touchokuTell) {
+          touchokuContents.push({
+            type: "text",
+            text: " 📞",
+            size: "lg",
+            action: {
+              type: "uri",
+              uri: `tel:${touchokuTell}`
+            },
+            flex: 0,
+            gravity: "center"
+          });
+        }
+
+        boxContents.push({
+          type: "box",
+          layout: "horizontal",
           margin: "xs",
-          wrap: true,
-          color: "#0066cc",
-          action: {
-            type: "uri",
-            uri: `https://line.worksmobile.com/message/send?version=28&emailList=${touchokuLineId}`
-          }
+          contents: touchokuContents
         });
       }
     } else {
@@ -359,6 +397,333 @@ function generateScheduleMessage(targetDateStr) {
   };
 }
 
+// ＝＝＝ 追加1：メイン機能 初回のチーム選択メッセージ生成関数 ＝＝＝
+function generateTeamListMessage() {
+  const ss = SpreadsheetApp.openById(PropertiesService.getScriptProperties().getProperty("SPREADSHEET_ID"));
+  const configSheet = ss.getSheetByName("設定");
+  let boxContents = [];
+
+  boxContents.push({
+    type: "text",
+    text: "📖 ドクターアドレス帳 ❤️",
+    weight: "bold",
+    size: "lg",
+    color: "#2c3e50",
+    margin: "md"
+  });
+  
+  boxContents.push({
+    type: "text",
+    text: "ℹ️チームを選択してください。\n📒今日の外来は「か」と送信。\n📅日付４桁で該当日の外来が表示🟢",
+    size: "sm",
+    color: "#7f8c8d",
+    margin: "sm",
+    wrap: true
+  });
+  
+  boxContents.push({ type: "separator", margin: "md" });
+
+  if (configSheet) {
+    const configData = configSheet.getDataRange().getValues();
+    
+    // ★追加：パステルカラーの配列（白文字でも読みやすい程度の落ち着いたパステル）
+    const pastelColors = ["#93b4d7", "#98c9a3", "#e6a0a0", "#eeb288", "#bda4ce", "#d7a3c3", "#7ebcb5"];
+    let colorIndex = 0;
+
+    for (let i = 1; i < configData.length; i++) {
+      let teamName = configData[i][0] ? configData[i][0].toString().trim() : "";
+      let emoji = configData[i][1] ? configData[i][1].toString().trim() : "";
+      let showAddress = configData[i][3] ? configData[i][3].toString().trim() : ""; // D列: アドレス表示
+
+      // ★修正箇所：入力されやすい「まる」の記号・漢数字をすべてカバー
+      if (teamName && (showAddress === "〇" || showAddress === "○" || showAddress === "◯" || showAddress === "◎")) {
+        
+        let btnColor = pastelColors[colorIndex % pastelColors.length];
+        
+        boxContents.push({
+          type: "button",
+          style: "primary", // ★変更：背景色をつけるために primary に変更
+          color: btnColor,  // ★変更：パステルカラーを適用
+          height: "sm",
+          action: {
+            type: "message",
+            label: `${emoji} ${teamName}チーム`,
+            text: `${teamName}チームの連絡先`,
+            postback: `REQ_TEAM:${teamName}`
+          },
+          margin: "sm"
+        });
+        
+        colorIndex++;
+      }
+    }
+  }
+
+  // 万が一対象チームが0個だった場合のフォールバック
+  if (boxContents.length === 3) {
+     boxContents.push({ type: "text", text: "設定シートにアドレス表示対象のチームがありません。", wrap: true });
+  }
+
+  return {
+    type: "flex",
+    altText: "チーム選択",
+    contents: {
+      type: "bubble",
+      body: {
+        type: "box",
+        layout: "vertical",
+        contents: boxContents
+      }
+    }
+  };
+}
+
+
+function generateAddressBookMessage(targetTeam) {
+  const ss = SpreadsheetApp.openById(PropertiesService.getScriptProperties().getProperty("SPREADSHEET_ID"));
+  
+  // 1. 設定シートから該当チームの絵文字を取得
+  let teamEmoji = "";
+  const configSheet = ss.getSheetByName("設定");
+  if (configSheet) {
+    const configData = configSheet.getDataRange().getValues();
+    for (let i = 1; i < configData.length; i++) {
+      let teamName = configData[i][0] ? configData[i][0].toString().trim() : "";
+      if (teamName === targetTeam) {
+        teamEmoji = configData[i][1] ? configData[i][1].toString().trim() : "";
+        break;
+      }
+    }
+  }
+
+  // 2. 当日のステータスマップを作成（時間は問わず、一日のスケジュールを格納）
+  let currentJST = new Date();
+  let targetDateStr = Utilities.formatDate(currentJST, "Asia/Tokyo", "yyyy/MM/dd");
+
+  const locations = ["船橋", "市川", "西船"];
+  const statusMap = {};
+  
+  locations.forEach(loc => {
+    const sheet = ss.getSheetByName(`スケジュール${loc}`);
+    if(!sheet) return;
+    
+    const data = sheet.getDataRange().getValues();
+    const records = data.slice(1).filter(row => {
+      if (!row[0]) return false;
+      const d = new Date(row[0]);
+      const dStr = `${d.getFullYear()}/${String(d.getMonth()+1).padStart(2, '0')}/${String(d.getDate()).padStart(2, '0')}`;
+      return dStr === targetDateStr;
+    });
+    
+    records.forEach(row => {
+      const roleFull = row[2] ? row[2].toString() : "";
+      const rawDoctor = row[3] ? row[3].toString().trim() : ""; // 表示名
+      const parts = roleFull.split("_");
+      const category = parts[0]; 
+      
+      // 拠点名を省略
+      let locShort = loc;
+      if (loc === "船橋") locShort = "船";
+      if (loc === "市川") locShort = "市";
+      if (loc === "西船") locShort = "西";
+
+      if (!statusMap[rawDoctor]) statusMap[rawDoctor] = []; // ★配列で初期化
+
+      // ★変更：同じステータスが重複しないようにチェックしてから追加する関数
+      let addStatus = (txt, type) => {
+        if (!statusMap[rawDoctor].some(s => s.text === txt)) {
+          statusMap[rawDoctor].push({ text: txt, type: type });
+        }
+      };
+
+      // 時間帯に関わらず、すべてのスケジュールを配列に追加
+      if (category === "外来午前") {
+        addStatus(`[AM]外：${locShort}`, "AM");
+      } else if (category === "外来午後") {
+        addStatus(`[PM]外：${locShort}`, "PM");
+      } else if (category === "回復/救急") {
+        addStatus(`回・救`, "KAIKYU");
+      } else if (category === "当直") {
+        addStatus(`当直`, "TOUCHOKU");
+      }
+    });
+  });
+
+  // 3. ドクターマスタから対象チームの先生のみを抽出
+  const masterSheet = ss.getSheetByName("ドクターマスタ");
+  const docs = [];
+  
+  if (masterSheet) {
+    const masterData = masterSheet.getDataRange().getValues();
+    for (let i = 1; i < masterData.length; i++) {
+      const dispName = masterData[i][0] ? masterData[i][0].toString().trim() : ""; // A列
+      const accountId = masterData[i][1] ? masterData[i][1].toString().trim() : ""; // B列
+      const teamName = masterData[i][2] ? masterData[i][2].toString().trim() : "";  // C列
+      const fullName = masterData[i][3] ? masterData[i][3].toString().trim() : "";  // D列
+      const ext = masterData[i][4] ? masterData[i][4].toString().trim() : "";       // E列
+      
+      // LINE WORKSアカウントがあり、かつ選択されたチームに所属している場合
+      if (accountId && teamName === targetTeam) {
+         let currentStatus = statusMap[dispName] || []; // ★配列で取得
+         docs.push({
+             dispName: dispName,
+             fullName: fullName,
+             accountId: accountId,
+             ext: ext,
+             status: currentStatus
+         });
+      }
+    }
+  }
+
+  // 4. アドレス帳メッセージ（Flex）を組み立て
+  let boxContents = [];
+  
+  // チーム名ヘッダー
+  boxContents.push({
+    type: "text",
+    text: `${teamEmoji} ${targetTeam}チーム`,
+    weight: "bold",
+    size: "lg",
+    color: "#2980b9",
+    margin: "md"
+  });
+  boxContents.push({ type: "separator", margin: "md" });
+  
+  if (docs.length === 0) {
+     boxContents.push({ type: "text", text: "このチームには連絡可能なドクターがいません。", margin: "md", wrap: true });
+  } else {
+     // チーム所属の各ドクター情報（横並びレイアウト）
+     docs.forEach(doc => {
+         let docRow = {
+             type: "box",
+             layout: "horizontal",
+             margin: "md",
+             spacing: "sm",
+             contents: []
+         };
+         
+         // 医師名 (D列を優先、無ければA列)
+         docRow.contents.push({
+             type: "text",
+             text: doc.fullName || doc.dispName,
+             size: "sm",
+             weight: "bold",
+             color: "#333333",
+             flex: 4,
+             gravity: "center"
+         });
+         
+         // ★変更：ステータス表示（spanを展開して1行で色分け複数表示）
+         if (doc.status && doc.status.length > 0) {
+             let spans = [];
+             doc.status.forEach((st, index) => {
+                 let fontColor = "#7f8c8d"; // デフォルト
+                 if (st.type === "AM") fontColor = "#2980b9"; // 青系
+                 if (st.type === "PM") fontColor = "#e74c3c"; // 赤系
+                 if (st.type === "KAIKYU") fontColor = "#27ae60"; // 緑色
+                 if (st.type === "TOUCHOKU") fontColor = "#8e44ad"; // 紫色
+                 
+                 // 最後の要素以外は半角スペースを入れて間をあける
+                 let textStr = st.text + (index < doc.status.length - 1 ? " " : "");
+
+                 spans.push({
+                     type: "span",
+                     text: textStr,
+                     size: "xxs",
+                     color: fontColor,
+                     weight: "bold"
+                 });
+             });
+
+             // textオブジェクトにspanを含めることで必ず1行にまとめる
+             docRow.contents.push({
+                 type: "text",
+                 contents: spans,
+                 flex: 3,
+                 gravity: "center",
+                 align: "center",
+                 wrap: true
+             });
+         } else {
+             docRow.contents.push({
+                 type: "text",
+                 text: " ",
+                 flex: 3,
+                 size: "xs"
+             });
+         }
+         
+         // LINEトークへのリンクボタン
+         docRow.contents.push({
+             type: "text",
+             text: "💬",
+             size: "lg",
+             action: {
+                 type: "uri",
+                 uri: `https://line.worksmobile.com/message/send?version=28&emailList=${doc.accountId}`
+             },
+             flex: 1,
+             gravity: "center"
+         });
+         
+         // 内線番号がある場合はTELリンクボタンを追加
+         if (doc.ext) {
+             docRow.contents.push({
+                 type: "text",
+                 text: "📞",
+                 size: "lg",
+                 action: {
+                     type: "uri",
+                     uri: `tel:${doc.ext}`
+                 },
+                 flex: 1,
+                 gravity: "center",
+                 align: "end"
+             });
+         } else {
+             // 見栄えを揃えるための空スペース
+             docRow.contents.push({
+                 type: "text",
+                 text: " ",
+                 flex: 1
+             });
+         }
+         
+         boxContents.push(docRow);
+     });
+  }
+
+  // チーム選択に戻るボタンを追加しておくと親切なので追加
+  boxContents.push({ type: "separator", margin: "xl" });
+  boxContents.push({
+    type: "button",
+    style: "link",
+    height: "sm",
+    action: {
+      type: "message",
+      label: "🔙 チーム選択に戻る",
+      text: "連絡先一覧",
+      postback: "REQ_TEAM_LIST"
+    },
+    margin: "md"
+  });
+
+  return {
+    type: "flex",
+    altText: `${targetTeam}チームの連絡先`,
+    contents: {
+      type: "bubble",
+      size: "mega",
+      body: {
+        type: "box",
+        layout: "vertical",
+        contents: boxContents
+      }
+    }
+  };
+}
+
 // ＝＝＝＝＝ ここから下がLINE WORKS Bot連携用のコードです ＝＝＝＝＝
 
 function doPost(e) {
@@ -389,22 +754,44 @@ function doPost(e) {
         return String.fromCharCode(s.charCodeAt(0) - 0xFEE0);
       }).trim();
 
+      // ★ルーティング処理：リクエスト内容によって返すメッセージを分岐
+      let isScheduleRequest = false;
+      let targetTeam = "";
+
       if (postbackData.startsWith("REQ_DATE:")) {
         targetDateStr = postbackData.replace("REQ_DATE:", "");
+        isScheduleRequest = true;
+      } else if (postbackData.startsWith("REQ_TEAM:")) {
+        // チーム選択ボタンが押された場合
+        targetTeam = postbackData.replace("REQ_TEAM:", "");
+      } else if (postbackData === "REQ_TEAM_LIST") {
+        // 「チーム選択に戻る」ボタンが押された場合（このままで下のelseに落ちてメニューが出ます）
       } else if (/^\d{4}$/.test(normalizedText)) {
+        // 4桁入力ならスケジュール表示
         let jstYear = Utilities.formatDate(new Date(), "Asia/Tokyo", "yyyy");
         let m = normalizedText.substring(0, 2);
         let d = normalizedText.substring(2, 4);
         targetDateStr = `${jstYear}/${m}/${d}`;
-      } else {
+        isScheduleRequest = true;
+      } else if (normalizedText === "か" || normalizedText === "カ") {
+        // 「か」または「カ」入力なら当日のスケジュール表示
         let targetDate = new Date();
-        if (userText.includes("明日")) {
-          targetDate.setDate(targetDate.getDate() + 1);
-        }
         targetDateStr = Utilities.formatDate(targetDate, "Asia/Tokyo", "yyyy/MM/dd");
+        isScheduleRequest = true;
       }
       
-      const messageContent = generateScheduleMessage(targetDateStr);
+      let messageContent;
+      if (isScheduleRequest) {
+        // 今まで通りの外来スケジュール表示
+        messageContent = generateScheduleMessage(targetDateStr);
+      } else if (targetTeam !== "") {
+        // 選択されたチームのドクター一覧アドレス帳を表示
+        messageContent = generateAddressBookMessage(targetTeam);
+      } else {
+        // 上記以外（何を発言しても）最初はチーム選択メニューを表示
+        messageContent = generateTeamListMessage();
+      }
+      
       sendLineWorksMessageToUser(props, userId, messageContent);
     }
   } catch (error) {
