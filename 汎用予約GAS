@@ -412,7 +412,7 @@ function updateReservationRemark(targetId, appendText) {
           sendErrorNotifyToPR("備考追加時のカレンダー更新エラー\n" + e.message);
         }
       } else {
-         sendErrorNotifyToPR("備考追加時のカレンダー更新エラー\nスクプレットプロパティの CALENDAR_ID が未設定です。");
+         sendErrorNotifyToPR("備考追加時のカレンダー更新エラー\nスクリプトプロパティの CALENDAR_ID が未設定です。");
       }
       
       // ドクターマスタのK列にも反映
@@ -1150,18 +1150,21 @@ function sendReminders() {
         const justBeforeMs = resStartMs - (justBeforeMins * 60 * 1000);
         
         // ① 当日リマインド送信判定
-        if (nowMs >= todayRemindMs && !cache.get('reminded_today_' + resId)) {
+        // 【修正】GASのキャッシュ寿命(最大6時間)による再送を防ぐため、送信許可時間をリマインド設定時刻から「1時間以内」に限定
+        const todayRemindEndMs = todayRemindMs + (60 * 60 * 1000);
+        if (nowMs >= todayRemindMs && nowMs <= todayRemindEndMs && !cache.get('reminded_today_' + resId)) {
           let text = `【本日リマインド】\n本日 ${Utilities.formatDate(resStartObj, "Asia/Tokyo", "HH:mm")}～ インタビュー予定です。\nよろしくお願いします。`;
           sendWorksMessage(doctorLineId, { "type": "text", "text": text });
-          cache.put('reminded_today_' + resId, 'true', 24 * 60 * 60); // 24時間キャッシュ（重複送信防止）
+          cache.put('reminded_today_' + resId, 'true', 21600); // 21600秒(6時間) ※GASの最大値
           writeLog(doctorLineId, "当日リマインド", `ID:${resId}`);
         }
         
         // ② 直前リマインド送信判定
-        if (nowMs >= justBeforeMs && !cache.get('reminded_justbefore_' + resId)) {
+        // 【修正】同じく、送信許可時間を「直前時刻〜予約開始時刻まで」に限定
+        if (nowMs >= justBeforeMs && nowMs <= resStartMs && !cache.get('reminded_justbefore_' + resId)) {
           let text = `【直前リマインド】\nまもなく ${Utilities.formatDate(resStartObj, "Asia/Tokyo", "HH:mm")} よりインタビューが開始されます。\nご準備をお願いします。`;
           sendWorksMessage(doctorLineId, { "type": "text", "text": text });
-          cache.put('reminded_justbefore_' + resId, 'true', 24 * 60 * 60); // 重複送信防止
+          cache.put('reminded_justbefore_' + resId, 'true', 21600); // 21600秒(6時間)
           writeLog(doctorLineId, "直前リマインド", `ID:${resId}`);
         }
       }
