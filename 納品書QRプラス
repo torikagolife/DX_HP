@@ -9,8 +9,7 @@
 :root{
   --paper:#f5f8f7; --surface:#ffffff; --ink:#1b2a25; --muted:#7b8a84;
   --line:#e3eae7; --accent:#2f8a74; --accent-soft:#edf6f3; --warn:#c26a3a;
-  --warn-soft:#fdf3ec; --red:#c0392b;
-  --t0:#eff5fa; --t0b:#dce9f4; --t0i:#4a7ea8;
+  --warn-soft:#fdf3ec; --bad:#b03030;
   --t1:#eef7f2; --t1b:#d9ece3; --t1i:#3d8b6d;
   --t2:#f6f3fa; --t2b:#e7dff2; --t2i:#7a6aa0;
   --t3:#fdf5ee; --t3b:#f3e4d5; --t3i:#a97a4d;
@@ -45,10 +44,15 @@ header p{margin:0;color:var(--muted);font-size:12.5px;flex-basis:100%}
 .opts label{display:flex;align-items:center;gap:6px;cursor:pointer}
 .opts select,.opts input[type=text]{font:inherit;font-family:var(--mono);font-size:12.5px;padding:3px 8px;
   border:1px solid var(--line);border-radius:6px;background:#fbfdfc}
-.opts input[type=text]{width:88px}
+.opts input[type=text]{width:86px}
 .opts input[type=checkbox]{accent-color:var(--accent)}
 .opts .sep{width:1px;align-self:stretch;background:var(--line)}
 .hint{color:var(--muted);font-size:12px}
+.maps{flex-basis:100%;font-size:12.5px}
+.maps summary{cursor:pointer;color:var(--accent);font-weight:700}
+.maps textarea{width:100%;margin-top:8px;min-height:64px;font-family:var(--mono);font-size:12.5px;
+  padding:8px 10px;border:1px solid var(--line);border-radius:6px;background:#fbfdfc;resize:vertical}
+.maps p{margin:6px 0 0;color:var(--muted);font-size:11.5px}
 
 #status{margin-top:14px;font-size:13px;color:var(--muted);min-height:20px}
 #status.err{color:var(--warn)}
@@ -63,23 +67,32 @@ header p{margin:0;color:var(--muted);font-size:12.5px;flex-basis:100%}
   border:1px solid var(--t1b);border-radius:6px;flex:none;cursor:zoom-in}
 .nhead .ninfo{flex:1;min-width:0;display:flex;flex-direction:column;gap:1px}
 .nhead input[type=checkbox]{width:16px;height:16px;accent-color:var(--accent);margin:0}
-.nhead label{display:flex;gap:10px;align-items:center;cursor:pointer}
+.nhead label{display:flex;gap:10px;align-items:center;cursor:pointer;flex-wrap:wrap}
 .nhead .sub{font-weight:400;color:var(--muted);font-size:12.5px}
-.nhead .sum{color:var(--red);font-weight:700}
+.nhead .total{font-weight:700;font-size:14px;color:var(--ink)}
+.nhead .sum{font-weight:700;color:var(--ink)}
 .nhead .fn{font-family:var(--mono);font-size:11.5px;color:var(--accent);background:var(--accent-soft);
   border-radius:8px;padding:0 9px;font-weight:400;margin-left:8px}
 
+.ptbl{width:100%;border-collapse:collapse}
+.ptbl th,.ptbl td{padding:0;text-align:left;font-weight:inherit}
+.nfoot{display:flex;gap:16px;align-items:center;justify-content:space-between;
+  padding:12px 16px;border-top:1px solid var(--line);background:#fbfdfc}
+.nfoot canvas.sheet{width:62px;height:62px;image-rendering:pixelated;background:#fff;
+  border:1px solid var(--t1b);border-radius:6px;flex:none;cursor:zoom-in}
+.nfoot .fspacer{flex:1}
 .item{border-top:1px solid var(--line);padding:14px 16px}
 .item .head{display:flex;gap:12px;align-items:baseline;flex-wrap:wrap;margin-bottom:10px}
 .item .code{font-family:var(--mono);font-weight:700;font-size:13.5px}
 .item .meta{color:var(--muted);font-size:12px}
-.item .tekiyo{color:var(--red);font-weight:700;font-size:12.5px}
+.item .tekiyo{color:var(--ink);font-weight:700;font-size:12.5px}
+.item .mergetag{font-size:11.5px;font-weight:700;color:var(--t4i);background:var(--t4);
+  border:1px solid var(--t4b);border-radius:8px;padding:0 8px}
 .item .no{font-family:var(--mono);font-size:11px;color:var(--accent);background:var(--accent-soft);
   border-radius:8px;padding:0 8px}
 
-.fields{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:14px}
+.fields{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:14px}
 .f{background:var(--tint);border:1px solid var(--tintb);border-radius:9px;padding:11px 12px 12px}
-.f.t0{--tint:var(--t0);--tintb:var(--t0b);--tinti:var(--t0i)}
 .f.t1{--tint:var(--t1);--tintb:var(--t1b);--tinti:var(--t1i)}
 .f.t2{--tint:var(--t2);--tintb:var(--t2b);--tinti:var(--t2i)}
 .f.t3{--tint:var(--t3);--tintb:var(--t3b);--tinti:var(--t3i)}
@@ -95,10 +108,12 @@ header p{margin:0;color:var(--muted);font-size:12.5px;flex-basis:100%}
 .f .bar{flex:1;height:4px;background:#fff;border:1px solid var(--tintb);border-radius:3px;overflow:hidden}
 .f .bar i{display:block;height:100%;background:var(--tinti);opacity:.65;width:0}
 .f .cnt{font-family:var(--mono);font-size:11px;color:var(--tinti);white-space:nowrap}
+.f .encwarn{display:none;margin-top:4px;font-size:11px;color:var(--bad);font-weight:700}
+.f.encbad .encwarn{display:block}
 .f.over input{border-color:var(--warn);background:var(--warn-soft)}
 .f.over .bar i{background:var(--warn);opacity:1}
 .f.over .cnt{color:var(--warn);font-weight:700}
-.f.bad canvas{border-color:var(--warn);background:var(--warn-soft)}
+.f.encbad canvas,.f.bad canvas{border-color:var(--bad)}
 
 #zoom{position:fixed;inset:0;background:rgba(27,42,37,.7);display:none;align-items:center;
   justify-content:center;z-index:50;padding:20px}
@@ -143,11 +158,16 @@ button:focus-visible{outline:2px solid var(--ink);outline-offset:2px}
   .nhead{background:none;border-bottom:1.2pt solid #000;padding:0 0 5pt;margin-bottom:8pt;gap:10pt}
   .nhead input[type=checkbox],.nhead .fn{display:none}
   .nhead canvas.sheet{width:20mm;height:20mm;border:none}
+  .ptbl thead{display:table-header-group}
+  .nfoot{background:none;border-top:.8pt solid #000;padding:5pt 0 0;margin-top:6pt}
+  .nfoot canvas.sheet{width:20mm;height:20mm;border:none}
   .nhead .sub{font-size:9pt;color:#000}
+  .nhead .total{font-size:12pt}
   .item{border-top:.5pt solid #999;padding:7pt 0;break-inside:avoid;page-break-inside:avoid}
   .item .head{margin-bottom:5pt}
   .item .meta{color:#333}
-  .item .tekiyo{color:#c0392b}
+  .item .tekiyo{color:#000;font-weight:700}
+  .item .mergetag{background:none;border:1px solid #666;color:#000;font-size:8pt}
   .fields{display:flex;gap:6pt}
   .f{flex:1;min-width:0;background:none;border:none;padding:0}
   .f label{color:#000;font-size:7.5pt;margin-bottom:2pt}
@@ -158,6 +178,7 @@ button:focus-visible{outline:2px solid var(--ink);outline-offset:2px}
   .f.over .bar{display:none}
   .f.over .cnt{color:#000;font-weight:700}
   .f.over input{border:none;background:none}
+  .f .encwarn{color:#000}
 }
 </style>
 </head>
@@ -189,14 +210,22 @@ button:focus-visible{outline:2px solid var(--ink);outline-offset:2px}
    <select id="qsz"><option value="46">小</option><option value="54" selected>中</option><option value="64">大</option></select>
   </label>
   <div class="sep"></div>
-  <label>↖️ 左上QR <input type="text" id="sqL" value="/42+"></label>
+  <label>▶️ 開始コード <input type="text" id="sqPre" value="/42+"></label>
+  <label>↖️ 左上QR <input type="text" id="sqL" value="99999+1"></label>
   <label>↗️ 右上QR <input type="text" id="sqR" value="99999,"></label>
-  <label><input type="checkbox" id="optPrefix" checked> 🔗 左上QRを1番目の償還コードに前置</label>
+  <label>↙️ 左下QR <input type="text" id="sqBL" value=""></label>
+  <label>↘️ 右下QR <input type="text" id="sqBR" value=""></label>
   <div class="sep"></div>
   <label><input type="checkbox" id="optOrig" checked> 📑 元の納品書ページも先頭に付ける</label>
-  <label><input type="checkbox" id="optCodeZen"> 🔡 商品コードも全角にする</label>
+  <label><input type="checkbox" id="optMerge" checked> 🔗 同じ商品コード・規格の行をまとめる</label>
   <label><input type="checkbox" id="optSplitDen"> ✂️ 伝票Noごとに分ける</label>
-  <span class="hint">💡 読み取り機が文字化けするときは文字コードを切り替えてください。</span>
+  <span class="hint">💡 開始コードは1品目めの償還コードの先頭に付きます。</span>
+
+  <details class="maps">
+   <summary>🔁 償還分類の読み替え表</summary>
+   <textarea id="mapText" spellcheck="false">164ﾂｲﾀｲｹｲｾｲﾖｳｻﾞｲﾘｮｳｾ=501503</textarea>
+   <p>1行1件。「納品書の表記=医事コンのコード」の形式で書きます。前後の記号やAの付与・数量サフィックスは自動で付くので、コード本体だけ書いてください。</p>
+  </details>
  </div>
 
  <div id="status"></div>
@@ -3014,35 +3043,50 @@ var qrcode = function() {
 
 /* ================================================================
    文字変換
+   Shift_JIS に無い文字（－ U+FF0D / ～ U+FF5E / ㎜ など）は
+   読み取り機で「?」に化けるため、必ず代替文字へ寄せる。
    ================================================================ */
+const HY = "\u2010";                 // ‐ SJIS 0x815D にマップされるハイフン
+const HYPHEN_SRC = /[-\u2010-\u2015\u2212\uff0d\uff5e\u301c~]/g;   // ハイフン類＋波ダッシュ
+const SPACES = /[\s\u3000]/g;
+
+/* 半角カナ→全角カナ */
 const HK="｡｢｣､･ｦｧｨｩｪｫｬｭｮｯｰｱｲｳｴｵｶｷｸｹｺｻｼｽｾｿﾀﾁﾂﾃﾄﾅﾆﾇﾈﾉﾊﾋﾌﾍﾎﾏﾐﾑﾒﾓﾔﾕﾖﾗﾘﾙﾚﾛﾜﾝﾞﾟ";
 const ZK="。「」、・ヲァィゥェォャュョッーアイウエオカキクケコサシスセソタチツテトナニヌネノハヒフヘホマミムメモヤユヨラリルレロワン゛゜";
 const DAKU={"ｶ":"ガ","ｷ":"ギ","ｸ":"グ","ｹ":"ゲ","ｺ":"ゴ","ｻ":"ザ","ｼ":"ジ","ｽ":"ズ","ｾ":"ゼ","ｿ":"ゾ",
  "ﾀ":"ダ","ﾁ":"ヂ","ﾂ":"ヅ","ﾃ":"デ","ﾄ":"ド","ﾊ":"バ","ﾋ":"ビ","ﾌ":"ブ","ﾍ":"ベ","ﾎ":"ボ","ｳ":"ヴ","ﾜ":"ヷ"};
 const HANDAKU={"ﾊ":"パ","ﾋ":"ピ","ﾌ":"プ","ﾍ":"ペ","ﾎ":"ポ"};
 
-/* 半角カナ→全角カナ、ASCII→全角。長音符「ー」は触らない */
+/* 全角化したときSJISに無くなる文字の逃がし先 */
+const ZEN_ALT={ "-":HY, "~":HY, '"':"\u201d", "'":"\u2019" };
+
+/* ㎜ ㎝ などの組文字を素の綴りへ（このあと全角化される） */
+const SQUARE={"\u339c":"mm","\u339d":"cm","\u339e":"km","\u338e":"mg","\u338f":"kg","\u338d":"ug",
+ "\u3396":"ml","\u3397":"dl","\u3398":"kl","\u33c4":"cc","\u3390":"Hz","\u33a1":"m2","\u33a0":"cm2",
+ "\u33a2":"km2","\u33a4":"cm3","\u33a5":"m3","\u339b":"nm","\u339a":"nm","\u3399":"fm"};
+const expandSquare = s => [...(s||"")].map(c=>SQUARE[c]!==undefined?SQUARE[c]:c).join("");
+
 function toZen(s){
   if(!s) return "";
-  let out=""; const a=[...s];
+  const a=[...expandSquare(s)];
+  let out="";
   for(let i=0;i<a.length;i++){
     const c=a[i], n=a[i+1];
     if(n==="ﾞ"&&DAKU[c]){ out+=DAKU[c]; i++; continue; }
     if(n==="ﾟ"&&HANDAKU[c]){ out+=HANDAKU[c]; i++; continue; }
     const k=HK.indexOf(c);
     if(k>=0){ out+=ZK[k]; continue; }
+    if(ZEN_ALT[c]!==undefined){ out+=ZEN_ALT[c]; continue; }
     const cp=c.codePointAt(0);
     if(cp===0x20){ out+="\u3000"; continue; }
     if(cp>=0x21&&cp<=0x7e){ out+=String.fromCodePoint(cp+0xfee0); continue; }
     out+=c;
   }
-  return out;
+  /* 元データに直接入っていた全角ハイフン・波ダッシュも寄せる */
+  return out.replace(HYPHEN_SRC, HY);
 }
-const HYPHENS = /[-\u2010-\u2015\u2212\uff0d]/g;   // 長音符 \u30fc は含めない
-const SPACES  = /[\s\u3000]/g;
-
-/* 商品名・規格：全角化 → スペース全削除 → ハイフンは全角－ */
-const toZenTight = s => toZen(s).replace(SPACES,"").replace(HYPHENS,"－");
+/* 商品名・規格：全角化 → 空白を全削除 */
+const toZenTight = s => toZen(s).replace(SPACES,"");
 
 /* 全角英数記号→半角 */
 function zenToHan(s){
@@ -3053,26 +3097,74 @@ function zenToHan(s){
     return c;
   }).join("").trim();
 }
-/* 償還コード：半角のまま → ハイフン削除 → ×2 は +2 → 頭にA */
-function toShokan(s){
-  if(!s) return "";
-  return "A"+zenToHan(s).replace(HYPHENS,"").replace(/[xX×✕]/g,"+");
+/* 規格欄がハイフンだけ＝規格なし。QRを作らない */
+function isNoSpec(s){
+  const t = zenToHan(s||"").replace(SPACES,"");
+  return t==="" || /^[-\u2010-\u2015\u2212\uff0d]+$/.test(t);
 }
 /* 「〇個1セット」判定 */
 function isSetSpec(spec){
   const z = toZen(spec).replace(/[０-９]/g,c=>String.fromCharCode(c.charCodeAt(0)-0xfee0));
   return /\d+個\s*1\s*セット/.test(z);
 }
-/* 金額：カンマ除去、末尾の .00 は落とす */
-const plainYen = s => zenToHan(s).replace(/,/g,"").replace(/\.0+$/,"");
+/* 規格が「20g」形式ならその数値 */
+function gramOf(spec){
+  const m = zenToHan(spec||"").replace(SPACES,"").match(/^(\d+)[gG]$/);
+  return m ? m[1] : null;
+}
+/* 金額：カンマを残したまま小数を落とす／数値化 */
+const yenComma = s => zenToHan(s).replace(/\.\d+$/,"");
+const yenNum   = s => { const n=parseFloat(zenToHan(s).replace(/,/g,"")); return isFinite(n)?n:0; };
+const withComma = n => String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+
+/* 数量セルの数値。空なら1個として扱う */
+const qtyNum = it => { const n=parseInt(zenToHan(it.qty||"").replace(/[^\d]/g,""),10); return isFinite(n)&&n>0?n:1; };
+/* 「〇個1セット」の〇 */
+function setCountOf(spec){
+  const z = toZen(spec).replace(/[０-９]/g,c=>String.fromCharCode(c.charCodeAt(0)-0xfee0));
+  const m = z.match(/(\d+)個\s*1\s*セット/);
+  return m ? parseInt(m[1],10) : null;
+}
+/* 償還コード末尾に付ける個数。グラム数・セット入数・数量を掛け合わせる */
+function countOf(it){
+  const q = it.qtyTotal || qtyNum(it);
+  const g = gramOf(it.spec);          if(g) return Number(g)*q;
+  const s = setCountOf(it.spec);      if(s) return s*q;
+  return q;
+}
+
+/* この品目の償還額。
+   ① 明細摘要に「20g償還価格10,700」とあればその金額が正
+   ② 規格がグラム表記なら 単価 × グラム数
+   ③ それ以外は単価そのもの
+   いずれも最後に数量を掛ける（セット物の単価は1セットあたりなので個数は掛けない） */
+function unitYen(it){
+  const m = (it.tekiyo||"").match(/償還価格\s*([\d,]+)/);
+  if(m) return yenNum(m[1]);
+  const g = gramOf(it.spec);
+  if(g) return yenNum(it.shokanka) * Number(g);
+  return yenNum(it.shokanka);
+}
+const itemYen = it => unitYen(it) * (it.qtyTotal || qtyNum(it));
 
 const len = s => [...(s||"")].length;
 const LIMIT = 24;
-/* 24文字ごとに切る（医事コンが次の行へ送る単位） */
 function chunk24(s){
   const a=[...(s||"")], out=[];
   for(let i=0;i<a.length;i+=LIMIT) out.push(a.slice(i,i+LIMIT).join(""));
   return out.length?out:[""];
+}
+
+/* SJISで表現できない文字を洗い出す（0x3F に潰れる＝読み取り機で「?」） */
+function badChars(text){
+  if($("#enc").value!=="SJIS") return [];
+  const f = qrcode.stringToBytesFuncs["SJIS"];
+  const bad=[];
+  for(const ch of [...(text||"")]){
+    if(ch==="?") continue;
+    try{ const b=f(ch); if(b.length===1 && b[0]===0x3f && bad.indexOf(ch)<0) bad.push(ch); }catch(e){}
+  }
+  return bad;
 }
 
 /* ================================================================
@@ -3084,8 +3176,19 @@ function chunk24(s){
 const COLS=[["c1",0,110],["c2",110,250],["cls",250,300],["unit",300,340],["p1",340,400],["p2",400,455],["lot",455,9999]];
 const HEADER_LABELS=["商","品コード","商品コード","商品名","単位","規格","数量","単価","金額","定価","償還価格",
   "ﾛｯﾄ番号","ロット番号","有効期限","明細摘要","償還分類","ｸﾗｽ分類","クラス分類","JANコード","ﾒｰｶｰ名","メーカー名"];
+const CLASS_WORDS=/^(高度|管理|一般|特定保守|生物|ｸﾗｽ|クラス)/;
 
 function colOf(x){ for(const [n,a,b] of COLS){ if(x>=a&&x<b) return n; } return "x"; }
+/* 商品名が長いと単位・クラス分類の列まで伸びる。短い語だけを
+   その列の値として認め、長い語は商品名の続きとして c2 に戻す。 */
+function colFor(w){
+  const c=colOf(w.x);
+  if(c==="cls"||c==="unit"){
+    const t=w.t;
+    if(!(CLASS_WORDS.test(t) || len(t)<=3 || /^[\d,.\s]+$/.test(t))) return "c2";
+  }
+  return c;
+}
 
 async function readPage(page){
   const vp = page.getViewport({scale:1});
@@ -3098,7 +3201,6 @@ async function readPage(page){
   }
   return {words, width:vp.width, height:vp.height};
 }
-/* 隙間があれば空白を入れて連結 */
 function joinGap(ws){
   let s="", end=null;
   for(const w of [...ws].sort((a,b)=>a.x-b.x)){
@@ -3119,9 +3221,9 @@ function groupRows(words){
   return rows.map(r=>{
     const cells={}, end={};
     for(const w of [...r.words].sort((a,b)=>a.x-b.x)){
-      const c=colOf(w.x);
+      const c=colFor(w);
       if(cells[c]===undefined) cells[c]=w.t;
-      else cells[c] += (w.x-end[c] > 1.5 ? " " : "") + w.t;
+      else cells[c] += (w.x-(end[c]??w.x) > 1.5 ? " " : "") + w.t;
       end[c]=w.x+(w.w||0);
     }
     return {y:r.y, cells, raw:r.words};
@@ -3160,7 +3262,6 @@ function parsePage(pg){
   });
   const body = rows.filter(r=>r.y>headBottom+3 && r.y<footTop-2);
 
-  /* 用紙下部【摘要】の1行目 */
   let summary="";
   if(footIdx>=0){
     for(let i=footIdx;i<rows.length;i++){
@@ -3197,6 +3298,10 @@ function parsePage(pg){
     if(!code && !name) continue;
     if(HEADER_LABELS.includes(code)) continue;
 
+    const shokanka = at(0,"p2");
+    /* 償還価格ゼロの行は登録対象外なので丸ごと落とす */
+    if(yenNum(shokanka) <= 0) continue;
+
     items.push({
       code, name,
       spec:   join(jan,mk),
@@ -3204,45 +3309,126 @@ function parsePage(pg){
       shokan: at(cl,"c2"),
       cls:    at(cl,"cls"),
       jan:    at(jan,"c1"),
-      unit:   at(0,"unit"),  qty:      at(mk,"unit"),
-      teika:  at(0,"p1"),    tanka:    at(mk,"p1"),
-      shokanka: at(0,"p2"),  kingaku:  at(mk,"p2"),
-      lot:    at(0,"lot"),   exp:      at(jan,"lot"),
-      tekiyo: at(mk,"lot")            // 6列目3行目＝明細摘要
+      unit:   at(0,"unit"),  qty:     at(mk,"unit"),
+      teika:  at(0,"p1"),    tanka:   at(mk,"p1"),
+      shokanka,              kingaku: at(mk,"p2"),
+      lot:    at(0,"lot"),   exp:     at(jan,"lot"),
+      tekiyo: at(mk,"lot")
     });
   }
   return {opDate, opDateDisp, den, patient, summary, items};
 }
 
 /* ================================================================
-   QRの中身を組み立てる
-   tint: 0商品コード 1償還 2商品名 3規格 4セット償還価格
+   償還コードの組み立て
+   ================================================================ */
+function mapTable(){
+  const out=[];
+  for(const line of ($("#mapText").value||"").split(/\r?\n/)){
+    const i=line.indexOf("=");
+    if(i<1) continue;
+    const k=line.slice(0,i).trim(), v=line.slice(i+1).trim();
+    if(k&&v) out.push([k,v]);
+  }
+  return out;
+}
+function applyMap(raw){
+  for(const [k,v] of mapTable()){
+    if(raw===k || raw.indexOf(k)>=0) return v;
+  }
+  return raw;
+}
+function buildShokanCode(part, it){
+  let base = zenToHan(part).replace(SPACES,"")
+               .replace(/[-\u2010-\u2015\u2212\uff0d]/g,"")
+               .replace(/[xX×✕]/g,"+");
+  if(!base) return "";
+  /* F0（FO）だけは先頭のAを付けない */
+  const head = /^F[O0]$/i.test(base) ? "" : "A";
+  const out = head + base;
+  const q = it.qtyTotal || qtyNum(it);
+  /* コード自体に ×N が入っている場合は、その N に数量を掛ける */
+  const m = out.match(/\+(\d+)$/);
+  if(m) return out.replace(/\+\d+$/, "+"+(parseInt(m[1],10)*q)) + ",";
+  return out + "+" + countOf(it) + ",";
+}
+/* 償還分類が「F8+F1-b-4」のように＋区切りなら複数コードに分ける */
+function shokanCodes(it){
+  const raw=(it.shokan||"").trim();
+  if(!raw) return [];
+  const mapped=applyMap(raw);
+  return mapped.split("+").map(s=>s.trim()).filter(Boolean)
+               .map(p=>buildShokanCode(p,it)).filter(Boolean);
+}
+
+/* ================================================================
+   1品目分のQRを組み立てる（tint 1=償還 2=商品名 3=規格 4=セット価格）
    ================================================================ */
 function payloadsFor(it, itemIndex){
   const out=[];
-  out.push({short:"商品コード", label:"🔢 商品コード", tint:0,
-    value: $("#optCodeZen").checked ? toZen(it.code) : it.code,
-    check: $("#optCodeZen").checked});
-
-  /* 1品目めの償還コードには左上QRを前置（読取り機のEnter対策） */
-  const pre = ($("#optPrefix").checked && itemIndex===0) ? sheetL() : "";
-  out.push({short:"償還コード", label:"💠 償還コード", tint:1,
-    value: pre + toShokan(it.shokan), check:true});
-
-  chunk24(toZenTight(it.name)).forEach((v,i)=>{
-    out.push({short: i===0?"商品名":"商品名 続き"+i,
-      label: i===0?"🏷️ 商品名":"🏷️ 商品名 続き"+i, tint:2, value:v, check:true});
+  const codes=shokanCodes(it);
+  codes.forEach((v,i)=>{
+    const pre = (itemIndex===0 && i===0) ? $("#sqPre").value : "";
+    out.push({short: codes.length>1 ? "償還コード"+(i+1) : "償還コード",
+      label: codes.length>1 ? "💠 償還コード"+(i+1) : "💠 償還コード",
+      tint:1, value: pre+v, check:true});
   });
-  chunk24(toZenTight(it.spec)).forEach((v,i)=>{
-    out.push({short: i===0?"規格":"規格 続き"+i,
-      label: i===0?"📏 規格":"📏 規格 続き"+i, tint:3, value:v, check:true});
-  });
-
+  if((it.name||"").trim()){
+    chunk24(toZenTight(it.name)).forEach((v,i)=>{
+      out.push({short: i===0?"商品名":"商品名 続き"+i,
+        label: i===0?"🏷️ 商品名":"🏷️ 商品名 続き"+i, tint:2, value:v, check:true});
+    });
+  }
+  if(!isNoSpec(it.spec)){
+    chunk24(toZenTight(it.spec)).forEach((v,i)=>{
+      out.push({short: i===0?"規格":"規格 続き"+i,
+        label: i===0?"📏 規格":"📏 規格 続き"+i, tint:3, value:v, check:true});
+    });
+  }
   if(isSetSpec(it.spec)){
     out.push({short:"セット償還価格", label:"🧮 セット償還価格", tint:4,
-      value:"(1セット "+plainYen(it.shokanka)+"円)", check:true});
+      value: toZen("(1セット"+yenComma(it.shokanka)+"円)"), check:true});
   }
   return out;
+}
+
+/* ================================================================
+   同じ商品コード・規格の行をまとめる
+   数量・金額・ロットを合算し、まとめた事実を残す
+   ================================================================ */
+function mergeItems(items){
+  const map=new Map(), out=[];
+  for(const it of items){
+    const key=(it.code||"")+"\u0001"+(it.spec||"");
+    const q=qtyNum(it);
+    if(map.has(key)){
+      const m=map.get(key);
+      m.qtyTotal += q;
+      m.kingakuTotal += yenNum(it.kingaku);
+      m.qtyParts.push(q);
+      m.rows += 1;
+      if(it.lot && m.lots.indexOf(it.lot)<0) m.lots.push(it.lot);
+      if(it.exp && m.exps.indexOf(it.exp)<0) m.exps.push(it.exp);
+      if(!m.tekiyo && it.tekiyo) m.tekiyo=it.tekiyo;
+    }else{
+      const m={...it, qtyTotal:q, kingakuTotal:yenNum(it.kingaku), qtyParts:[q], rows:1,
+               lots: it.lot?[it.lot]:[], exps: it.exp?[it.exp]:[]};
+      map.set(key,m); out.push(m);
+    }
+  }
+  for(const m of out){
+    m.qty = String(m.qtyTotal);
+    m.lot = m.lots.join("、");
+    m.exp = m.exps.join("、");
+    m.kingaku = withComma(m.kingakuTotal);
+    m.merged = m.rows>1;
+    m.mergeNote = m.merged ? m.rows+"行をまとめ（数量 "+m.qtyParts.join("＋")+"）" : "";
+  }
+  return out;
+}
+/* まとめない場合も数量の合計欄を用意しておく */
+function noMerge(items){
+  return items.map(it=>({...it, qtyTotal:qtyNum(it), rows:1, merged:false, mergeNote:""}));
 }
 
 /* ================================================================
@@ -3257,19 +3443,24 @@ function setStatus(msg,isErr){ statusEl.textContent=msg||""; statusEl.className=
 const selected = ()=>NOTES.filter(n=>n.selected);
 const sheetL = ()=>$("#sqL").value;
 const sheetR = ()=>$("#sqR").value;
-/* 前置モードでは左上に単独QRを置かない */
-const showLeftQR = ()=>!$("#optPrefix").checked;
+const sheetBL = ()=>$("#sqBL").value;
+const sheetBR = ()=>$("#sqBR").value;
+const hasFoot = ()=>!!(sheetBL().trim()||sheetBR().trim());
+const totalOf = n => n.items.reduce((a,it)=>a+itemYen(it),0);
+const totalText = n => "💰 合計：" + withComma(totalOf(n)) + "円";
 
 function safeName(s){ return (s||"").replace(/[\\\/:*?"<>|]/g,"_").replace(SPACES,""); }
 function fileNameFor(n){ return (n.opDate||"日付不明")+"_"+(safeName(n.patient)||"患者名不明"); }
 function esc(s){ return String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
-/* タイトル行の摘要以外（ロット・数量） */
 function itemMeta(it){
-  return [ it.lot?"🔖 ロット "+it.lot:"", it.qty?"🔢 数量 "+it.qty+(it.unit||""):"" ]
+  return [ it.lot?"🔖 ロット "+it.lot:"", it.qty?"🔢 数量 "+it.qty+(it.unit||""):"",
+           "💴 償還 "+withComma(itemYen(it))+"円" ]
          .filter(Boolean).join("　／　");
 }
 function itemMetaPlain(it){
-  return [ it.lot?"ロット "+it.lot:"", it.qty?"数量 "+it.qty+(it.unit||""):"" ]
+  return [ it.lot?"ロット "+it.lot:"", it.qty?"数量 "+it.qty+(it.unit||""):"",
+           "償還 "+withComma(itemYen(it))+"円",
+           it.merged?"【"+it.mergeNote+"】":"" ]
          .filter(Boolean).join("　／　");
 }
 
@@ -3320,25 +3511,34 @@ function render(){
     const box=document.createElement("div");
     box.className="note"+(n.selected?"":" unsel");
 
-    /* ---- 元納品書ページ（印刷時のみ表示。QRページの直前に入る） ---- */
     if(n.origImgs && n.origImgs.length){
       const o=document.createElement("div"); o.className="orig";
       n.origImgs.forEach(src=>{
-        const im=document.createElement("img");
-        im.src=src; im.alt="元の納品書";
+        const im=document.createElement("img"); im.src=src; im.alt="元の納品書";
         o.appendChild(im);
       });
       box.appendChild(o);
     }
 
-    /* ---- 用紙ヘッダー ---- */
+    const tbl=document.createElement("table"); tbl.className="ptbl";
+    const thead=document.createElement("thead");
+    const thr=document.createElement("tr");
+    const th=document.createElement("th");
+    const tbody=document.createElement("tbody");
+    const tdr=document.createElement("tr");
+    const td=document.createElement("td");
+    thr.appendChild(th); thead.appendChild(thr);
+    tdr.appendChild(td); tbody.appendChild(tdr);
+    tbl.appendChild(thead); tbl.appendChild(tbody);
+
     const h=document.createElement("h2"); h.className="nhead";
     h.innerHTML=
-      (showLeftQR() ? '<canvas class="sheet" data-side="L" tabindex="0" role="button" aria-label="左上QRを拡大"></canvas>' : '')+
+      '<canvas class="sheet" data-side="L" tabindex="0" role="button" aria-label="左上QRを拡大"></canvas>'+
       '<div class="ninfo">'+
         '<label><input type="checkbox"'+(n.selected?" checked":"")+'>'+
-        '<span>🧑 '+esc(n.patient||"患者名不明")+' 様</span>'+
-        '<span class="sub">📅 手術日 '+(n.opDateDisp||"—")+'</span></label>'+
+        '<span>🧑 '+esc(n.patient||"患者名不明")+' 様</span></label>'+
+        '<span class="sub">📅 手術日 '+(n.opDateDisp||"—")+
+          '　<span class="total">'+esc(totalText(n))+'</span></span>'+
         '<span class="sub">🧾 伝票 '+esc(n.den||"—")+'　📦 '+n.items.length+'品目'+
           (n.summary?'　<span class="sum">📝 '+esc(n.summary)+'</span>':'')+
           '<span class="fn">'+esc(fn)+'.pdf</span></span>'+
@@ -3355,9 +3555,9 @@ function render(){
       box.classList.toggle("unsel",!n.selected);
       updateCounts();
     });
-    box.appendChild(h);
+    th.appendChild(h);
+    box.appendChild(tbl);
 
-    /* ---- 品目 ---- */
     n.items.forEach((it,ii)=>{
       const specs=payloadsFor(it,ii);
       if(!it.payload || it.payload.length!==specs.length) it.payload=specs.map(p=>p.value);
@@ -3367,6 +3567,7 @@ function render(){
       head.innerHTML='<span class="no">'+(ii+1)+'</span><span class="code">'+esc(it.code)+'</span>'+
         '<span>'+esc(it.name)+'</span>'+
         '<span class="meta">'+esc(itemMeta(it))+'</span>'+
+        (it.merged?'<span class="mergetag">🔗 '+esc(it.mergeNote)+'</span>':'')+
         (it.tekiyo?'<span class="tekiyo">📝 '+esc(it.tekiyo)+'</span>':'');
       d.appendChild(head);
 
@@ -3377,7 +3578,8 @@ function render(){
         f.innerHTML='<label for="'+id+'">'+p.label+'</label>'+
           '<canvas tabindex="0" role="button" aria-label="'+p.short+'のQRを拡大"></canvas>'+
           '<input id="'+id+'" value="'+esc(it.payload[pi])+'">'+
-          '<div class="meter"><div class="bar"><i></i></div><span class="cnt"></span></div>';
+          '<div class="meter"><div class="bar"><i></i></div><span class="cnt"></span></div>'+
+          '<div class="encwarn"></div>';
         const inp=f.querySelector("input"), cv=f.querySelector("canvas");
         let timer=null;
         const refresh=()=>{
@@ -3386,6 +3588,10 @@ function render(){
           f.querySelector(".bar i").style.width=Math.min(100,L/LIMIT*100)+"%";
           f.querySelector(".cnt").textContent=L+" / "+LIMIT+"字";
           f.classList.toggle("over", p.check && L>LIMIT);
+          const bad=badChars(inp.value);
+          f.classList.toggle("encbad", bad.length>0);
+          f.querySelector(".encwarn").textContent =
+            bad.length ? "⚠ この文字コードで出せない文字： "+bad.join(" ") : "";
           f.classList.toggle("bad", !paintQR(cv, inp.value, 440));
         };
         inp.addEventListener("input",()=>{ clearTimeout(timer); timer=setTimeout(refresh,220); });
@@ -3396,8 +3602,26 @@ function render(){
         g.appendChild(f);
       });
       d.appendChild(g);
-      box.appendChild(d);
+      td.appendChild(d);
     });
+
+    /* 用紙下部QR（中身が入っているときだけ出す） */
+    if(hasFoot()){
+      const foot=document.createElement("div"); foot.className="nfoot";
+      const mk=(txt,lab)=>{
+        if(!txt.trim()) return document.createElement("span");
+        const cv=document.createElement("canvas");
+        cv.className="sheet"; cv.tabIndex=0; cv.setAttribute("role","button");
+        cv.setAttribute("aria-label",lab+"を拡大");
+        paintQR(cv,txt,280);
+        cv.addEventListener("click",()=>openZoom(lab,txt));
+        return cv;
+      };
+      foot.appendChild(mk(sheetBL(),"左下QR"));
+      const sp=document.createElement("div"); sp.className="fspacer"; foot.appendChild(sp);
+      foot.appendChild(mk(sheetBR(),"右下QR"));
+      td.appendChild(foot);
+    }
     resultEl.appendChild(box);
   });
   updateCounts();
@@ -3451,7 +3675,6 @@ async function loadFiles(files){
         if(!g.den) g.den=parsed.den;
         if(!g.summary) g.summary=parsed.summary;
         if(!g.opDate){ g.opDate=parsed.opDate; g.opDateDisp=parsed.opDateDisp; }
-        /* 印刷用に元ページを画像化しておく */
         const vp=page.getViewport({scale:1.6});
         const cv=document.createElement("canvas");
         cv.width=vp.width; cv.height=vp.height;
@@ -3464,10 +3687,14 @@ async function loadFiles(files){
     setStatus("⚠️ PDFを読めませんでした。テキスト付きのPDFか確認してください。("+e.message+")",true);
     return;
   }
-  NOTES=[...groups.values()];
+  NOTES=[...groups.values()].filter(n=>n.items.length);
+  NOTES.forEach(n=>{ n.rawItems=n.items; });
+  applyMerge();
   dlEl.innerHTML="";
-  if(!NOTES.length){ setStatus("⚠️ 納品明細が見つかりませんでした。別のPDFで試してください。",true); render(); return; }
-  setStatus("✅ 読み込み完了。QRはこの画面からそのまま読み取れます。文字を直すとQRも作り直されます。");
+  if(!NOTES.length){ setStatus("⚠️ 登録対象の明細が見つかりませんでした。",true); render(); return; }
+  const merged=NOTES.reduce((a,n)=>a+n.items.filter(i=>i.merged).length,0);
+  setStatus("✅ 読み込み完了。償還価格ゼロの行は自動で除いています。"+
+    (merged?"同じ商品コード・規格の行を "+merged+"件 まとめました。":""));
   render();
 }
 
@@ -3495,35 +3722,46 @@ function ellipsis(c,s,max){
 }
 function drawHeader(c,n,pageNo,pages){
   const tmp=document.createElement("canvas");
-  let x = MARGIN;
-  if(showLeftQR()){
-    paintQR(tmp, sheetL(), SQ*SCALE);
-    c.drawImage(tmp, MARGIN, MARGIN, SQ, SQ);
-    x = MARGIN+SQ+16;
-  }
+  paintQR(tmp, sheetL(), SQ*SCALE);
+  c.drawImage(tmp, MARGIN, MARGIN, SQ, SQ);
   paintQR(tmp, sheetR(), SQ*SCALE);
   c.drawImage(tmp, PW-MARGIN-SQ, MARGIN, SQ, SQ);
 
-  const right = PW-MARGIN-SQ-16, w = right-x;
+  const x = MARGIN+SQ+14, right = PW-MARGIN-SQ-14, w = right-x;
   c.fillStyle="#000"; c.font='700 15px '+FONT;
-  c.fillText(ellipsis(c,(n.patient||"患者名不明")+" 様", w), x, MARGIN+18);
-  c.font='11px '+FONT; c.fillStyle="#333";
-  c.fillText(ellipsis(c,"手術日 "+(n.opDateDisp||"—"), w), x, MARGIN+34);
+  c.fillText(ellipsis(c,(n.patient||"患者名不明")+" 様", w), x, MARGIN+17);
 
-  /* 伝票 / 品目数 / ページ ＋ その右に【摘要】1行目（赤） */
-  c.fillStyle="#555";
+  /* 手術日 ＋ その右に合計（氏名と同じ大きさ） */
+  c.font='11px '+FONT; c.fillStyle="#333";
+  const dt="手術日 "+(n.opDateDisp||"—")+"　　";
+  c.fillText(dt, x, MARGIN+37);
+  const dw=c.measureText(dt).width;
+  c.font='700 15px '+FONT; c.fillStyle="#000";
+  c.fillText(ellipsis(c,totalText(n), Math.max(60,w-dw)), x+dw, MARGIN+37);
+
+  c.font='10.5px '+FONT; c.fillStyle="#555";
   const lead="伝票No. "+(n.den||"—")+"　　"+n.items.length+"品目　　"+pageNo+" / "+pages+"　　";
-  c.fillText(lead, x, MARGIN+50);
+  c.fillText(lead, x, MARGIN+53);
   if(n.summary){
     const lw=c.measureText(lead).width;
-    c.fillStyle="#c0392b"; c.font='700 11px '+FONT;
-    c.fillText(ellipsis(c,n.summary, Math.max(40,w-lw)), x+lw, MARGIN+50);
+    c.font='700 10.5px '+FONT; c.fillStyle="#000";
+    c.fillText(ellipsis(c,n.summary, Math.max(40,w-lw)), x+lw, MARGIN+53);
   }
 
-  const base = MARGIN+SQ+6;
+  const base = MARGIN+SQ+8;
   c.strokeStyle="#000"; c.lineWidth=.9;
   c.beginPath(); c.moveTo(MARGIN,base); c.lineTo(PW-MARGIN,base); c.stroke();
   return base;
+}
+
+function drawFooter(c){
+  if(!hasFoot()) return;
+  const tmp=document.createElement("canvas");
+  const fy=PH-MARGIN-SQ;
+  c.strokeStyle="#000"; c.lineWidth=.9;
+  c.beginPath(); c.moveTo(MARGIN,fy-8); c.lineTo(PW-MARGIN,fy-8); c.stroke();
+  if(sheetBL().trim()){ paintQR(tmp, sheetBL(), SQ*SCALE); c.drawImage(tmp, MARGIN, fy, SQ, SQ); }
+  if(sheetBR().trim()){ paintQR(tmp, sheetBR(), SQ*SCALE); c.drawImage(tmp, PW-MARGIN-SQ, fy, SQ, SQ); }
 }
 
 async function buildNote(n){
@@ -3532,7 +3770,6 @@ async function buildNote(n){
   const doc=new jsPDF({unit:"pt",format:"a4",compress:true});
   let first=true;
 
-  /* 元納品書 → そのあとにQRページ（ニコイチ） */
   if($("#optOrig").checked){
     for(const src of (n.origImgs||[])){
       if(!first) doc.addPage();
@@ -3541,13 +3778,16 @@ async function buildNote(n){
     }
   }
 
-  const cardH = 46 + qsz + 30;
-  const headH = SQ+6+16;
-  const perPage = Math.max(1, Math.floor((PH - MARGIN*2 - headH) / cardH));
+  const cardH = qsz + 58;
+  const headH = SQ+8+12;
+  const footH = hasFoot() ? SQ+10 : 0;
+  const bottomY = PH - MARGIN - footH;
+  const perPage = Math.max(1, Math.floor((PH - MARGIN*2 - headH - footH) / cardH));
   const pages = Math.max(1, Math.ceil(n.items.length / perPage));
   let sheet=null, y=0, pageNo=0;
   const flush=()=>{
     if(!sheet) return;
+    drawFooter(sheet.c);
     if(!first) doc.addPage();
     first=false;
     doc.addImage(sheet.cv,"PNG",0,0,PW,PH);
@@ -3555,27 +3795,27 @@ async function buildNote(n){
   };
 
   n.items.forEach((it,ii)=>{
-    if(!sheet || y+cardH > PH-MARGIN){
+    if(!sheet || y+cardH > bottomY){
       flush();
       sheet=newSheet(); pageNo++;
-      y=drawHeader(sheet.c,n,pageNo,pages)+16;
+      y=drawHeader(sheet.c,n,pageNo,pages)+12;
     }
     const c=sheet.c;
 
-    /* タイトル行：商品コード 商品名 ロット 数量 明細摘要(赤) */
+    /* タイトル行：商品コード 商品名 ／ ロット 数量 償還額 明細摘要（太字） */
     c.fillStyle="#000"; c.font='700 12px '+MONO;
-    c.fillText(it.code||"", MARGIN, y+11);
+    c.fillText(it.code||"", MARGIN, y+10);
     const codeW=c.measureText(it.code||"").width;
     c.font='12px '+FONT;
-    c.fillText(ellipsis(c,it.name||"",PW-MARGIN*2-codeW-14), MARGIN+codeW+12, y+11);
+    c.fillText(ellipsis(c,it.name||"",PW-MARGIN*2-codeW-14), MARGIN+codeW+12, y+10);
 
     c.font='10px '+FONT; c.fillStyle="#555";
     const meta=itemMetaPlain(it)+(itemMetaPlain(it)&&it.tekiyo?"　／　":"");
-    c.fillText(meta, MARGIN, y+26);
+    c.fillText(meta, MARGIN, y+24);
     if(it.tekiyo){
       const mw=c.measureText(meta).width;
-      c.fillStyle="#c0392b"; c.font='700 10px '+FONT;
-      c.fillText(ellipsis(c,it.tekiyo,PW-MARGIN*2-mw), MARGIN+mw, y+26);
+      c.font='700 10px '+FONT; c.fillStyle="#000";
+      c.fillText(ellipsis(c,it.tekiyo,PW-MARGIN*2-mw), MARGIN+mw, y+24);
     }
 
     const specs=payloadsFor(it,ii);
@@ -3584,27 +3824,34 @@ async function buildNote(n){
     const eff=Math.min(qsz, Math.floor((avail-8*(cnt-1))/cnt));
     const gap=cnt>1 ? (avail-eff*cnt)/(cnt-1) : 0;
     let qx=MARGIN;
-    const qy=y+38;
+    const qy=y+30;
+    const slot=eff+gap-4;
     specs.forEach((p,i)=>{
       const val = it.payload ? it.payload[i] : p.value;
       const cv=document.createElement("canvas");
       paintQR(cv, val, eff*SCALE);
       c.drawImage(cv,qx,qy,eff,eff);
       c.strokeStyle="#bbb"; c.lineWidth=.5; c.strokeRect(qx+.25,qy+.25,eff-.5,eff-.5);
+
+      /* ラベル行。警告は独立行にせず同じ行の右へ出して1行ぶん節約する */
       c.fillStyle="#000"; c.font='8px '+FONT;
-      c.fillText(ellipsis(c,p.short,eff+gap-4), qx, qy+eff+11);
-      c.fillStyle="#333"; c.font='7.5px '+MONO;
-      c.fillText(ellipsis(c,val||"",eff+gap-4), qx, qy+eff+21);
-      if(p.check && len(val)>LIMIT){
-        c.fillStyle="#c26a3a"; c.font='700 8px '+FONT;
-        c.fillText("⚠ "+len(val)+"文字", qx, qy+eff+31);
+      const notes=[];
+      if(p.check && len(val)>LIMIT) notes.push("⚠"+len(val)+"字");
+      if(badChars(val).length) notes.push("⚠化け");
+      const lab=ellipsis(c, p.short, notes.length ? slot-34 : slot);
+      c.fillText(lab, qx, qy+eff+9);
+      if(notes.length){
+        c.fillStyle="#b03030"; c.font='700 8px '+FONT;
+        c.fillText(notes.join(" "), qx+c.measureText(lab).width+4, qy+eff+9);
       }
+      c.fillStyle="#333"; c.font='7.5px '+MONO;
+      c.fillText(ellipsis(c,val||"",slot), qx, qy+eff+18);
       qx+=eff+gap;
     });
 
     y+=cardH;
     c.strokeStyle="#ddd"; c.lineWidth=.6;
-    c.beginPath(); c.moveTo(MARGIN,y-8); c.lineTo(PW-MARGIN,y-8); c.stroke();
+    c.beginPath(); c.moveTo(MARGIN,y-4); c.lineTo(PW-MARGIN,y-4); c.stroke();
   });
   flush();
   return doc.output("blob");
@@ -3652,19 +3899,23 @@ toggleAllBtn.addEventListener("click",()=>{
 });
 
 clearBtn.addEventListener("click",()=>{
-  NOTES=[];
-  resultEl.innerHTML="";
-  dlEl.innerHTML="";
-  $("#file").value="";
+  NOTES=[]; resultEl.innerHTML=""; dlEl.innerHTML=""; $("#file").value="";
   setStatus("🧹 クリアしました。次の納品書PDFをドロップしてください。");
   updateCounts();
 });
 
+function applyMerge(){
+  const on=$("#optMerge").checked;
+  NOTES.forEach(n=>{
+    n.items = on ? mergeItems(n.rawItems||n.items) : noMerge(n.rawItems||n.items);
+    n.items.forEach(it=>{ delete it.payload; });
+  });
+}
+
 function addLink(name, blob){
   const a=document.createElement("a");
   a.href=URL.createObjectURL(blob); a.download=name; a.textContent=name;
-  dlEl.appendChild(a);
-  a.click();
+  dlEl.appendChild(a); a.click();
 }
 
 /* ---------- 入力 ---------- */
@@ -3680,14 +3931,21 @@ drop.addEventListener("drop",e=>{
 });
 
 ["enc","ecl"].forEach(id=>$("#"+id).addEventListener("change",()=>{ if(NOTES.length) render(); }));
-["sqL","sqR"].forEach(id=>{
+["sqPre","sqL","sqR","sqBL","sqBR","mapText"].forEach(id=>{
   let t=null;
-  $("#"+id).addEventListener("input",()=>{ clearTimeout(t); t=setTimeout(()=>{ if(NOTES.length) render(); },300); });
+  $("#"+id).addEventListener("input",()=>{
+    clearTimeout(t);
+    t=setTimeout(()=>{
+      NOTES.forEach(n=>n.items.forEach(it=>{ delete it.payload; }));
+      if(NOTES.length) render();
+    },400);
+  });
 });
-["optCodeZen","optSplitDen","optPrefix","optOrig"].forEach(id=>$("#"+id).addEventListener("change",()=>{
+["optSplitDen","optOrig"].forEach(id=>$("#"+id).addEventListener("change",()=>{
   NOTES.forEach(n=>n.items.forEach(it=>{ delete it.payload; }));
   render();
 }));
+$("#optMerge").addEventListener("change",()=>{ if(NOTES.length){ applyMerge(); render(); } });
 document.body.classList.toggle("with-orig", $("#optOrig").checked);
 })();
 </script>
