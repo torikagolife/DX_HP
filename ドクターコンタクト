@@ -520,6 +520,20 @@ function generateAddressBookMessage(targetTeam) {
     }
   }
 
+  // ★追加：チーム名 → グループトーク用スクリプトプロパティキーのマップ
+  //         専門・総合はグループが存在しないのでここに載せない＝自動でボタン非表示になる
+  const groupPropKeyMap = {
+    "脊椎": "SEKITSUI_G",
+    "上肢": "JOUSHI_G",
+    "下肢": "KASHI_G",
+    "人工": "JINKOU_G",
+    "麻酔": "MASUI_G"
+  };
+  const groupPropKey = groupPropKeyMap[targetTeam];
+  const groupChannelId = groupPropKey
+    ? PropertiesService.getScriptProperties().getProperty(groupPropKey)
+    : null;
+
   // 2. 当日のステータスマップを作成（時間は問わず、一日のスケジュールを格納）
   let currentJST = new Date();
   let targetDateStr = Utilities.formatDate(currentJST, "Asia/Tokyo", "yyyy/MM/dd");
@@ -649,6 +663,23 @@ function generateAddressBookMessage(targetTeam) {
     color: "#2980b9",
     margin: "md"
   });
+
+  // ★追加：グループへのLINEボタン（グループトークが存在するチームのみ表示）
+  if (groupChannelId) {
+    boxContents.push({
+      type: "button",
+      style: "primary",
+      color: "#06C755",
+      height: "sm",
+      action: {
+        type: "uri",
+        label: "💬 グループへLINE",
+        uri: `https://line.worksmobile.com/message/send?version=28&channelId=${groupChannelId}`
+      },
+      margin: "md"
+    });
+  }
+
   boxContents.push({ type: "separator", margin: "md" });
   
   if (docs.length === 0) {
