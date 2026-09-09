@@ -10,8 +10,11 @@ function processExcelUpload(fileObj) {
     const blob = Utilities.newBlob(decoded);
     
     // 🌟CSVとして直接読み込む（文字化け対策込み）
+    // ★修正：文字化け検出の判定文字が空文字になっており常にtrueだったため、
+    //         Shift_JISが正しく読めていてもUTF-8で読み直されてしまっていた。
+    //         デコード失敗時に現れる置換文字(U+FFFD)の有無で判定するよう修正。
     let text = blob.getDataAsString("Shift_JIS");
-    if (text.includes('')) { text = blob.getDataAsString("UTF-8"); }
+    if (text.indexOf('\uFFFD') !== -1) { text = blob.getDataAsString("UTF-8"); }
     text = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
     
     const values = Utilities.parseCsv(text);
@@ -46,19 +49,29 @@ function processExcelUpload(fileObj) {
 
           let rawCat = categories[c];
           let rawSub = subCategories[c];
-          
-          let finalAmPm = rawCat.includes("午前") ? "午前" : (rawCat.includes("午後") ? "午後" : "終日");
-          let finalRole = rawSub;
+
+          // ★修正：generateScheduleMessage / generateAddressBookMessage は
+          //   row[2] を「カテゴリ_詳細」形式の1文字列、row[3] を医師名として読む。
+          //   これまでは午前/午後・役割・医師名を別々の列(2,3,4)に分けて書き込んでいたため、
+          //   表示側の期待する列と噛み合わず、船橋のExcel取り込み分が正しく表示されていなかった。
+          let category;
+          let detail;
 
           if (rawCat.includes("回復期") || rawCat.includes("救急")) {
-            finalRole = "回復・救急";
-            finalAmPm = (rawSub.includes("9時") || rawSub === "午前") ? "午前" : "午後";
+            category = "回復/救急"; // 表示側のカード振り分けキーに合わせる
+            detail = rawSub;
           } else if (rawCat.includes("残り番") || rawCat.includes("当直")) {
-            finalAmPm = "午後";
-            finalRole = rawCat.includes("残り番") ? "残り番" : "当直";
+            category = "当直"; // 表示側のカード振り分けキーに合わせる
+            detail = rawCat.includes("残り番") ? "残り番" : "当直"; // アドレス帳側の「残り番」判定に必要
+          } else {
+            let finalAmPm = rawCat.includes("午前") ? "午前" : (rawCat.includes("午後") ? "午後" : "午前");
+            category = finalAmPm === "午前" ? "外来午前" : "外来午後";
+            detail = rawSub;
           }
-          
-          outputData.push([dateStr, "船橋", finalAmPm, finalRole, docName]);
+
+          const roleFull = `${category}_${detail}`;
+
+          outputData.push([dateStr, "船橋", roleFull, docName]);
         }
       }
     }
@@ -67,11 +80,12 @@ function processExcelUpload(fileObj) {
     let targetSheet = activeSS.getSheetByName("スケジュール船橋");
     if (!targetSheet) {
       targetSheet = activeSS.insertSheet("スケジュール船橋");
-      targetSheet.appendRow(["日付", "拠点", "午前/午後", "役割", "医師名"]);
+      // ★修正：列構成を「日付/拠点/役割(カテゴリ_詳細)/医師名」の4列に変更
+      targetSheet.appendRow(["日付", "拠点", "役割", "医師名"]);
     }
     
     if (outputData.length > 0) {
-      targetSheet.getRange(targetSheet.getLastRow() + 1, 1, outputData.length, 5).setValues(outputData);
+      targetSheet.getRange(targetSheet.getLastRow() + 1, 1, outputData.length, 4).setValues(outputData);
     }
 
     return `🎉 大成功！\n${outputData.length}件をDBに展開しました。`;
@@ -94,6 +108,9 @@ function testGenerateMessage() {
 function generateScheduleMessage(targetDateStr) {
   const ss = SpreadsheetApp.openById(PropertiesService.getScriptProperties().getProperty("SPREADSHEET_ID"));
   
+  // ★追加：表記ゆれ吸収関数（スペース削除、旧字体や異体字を統一）
+  const norm = (str) => str.replace(/[  ]/g, "").replace(/[齋斎齊]/g, "斉").replace(/[澤]/g, "沢").replace(/[髙]/g, "高").replace(/[﨑]/g, "崎").replace(/[邊邉]/g, "辺");
+
   // ★追加：表示用に曜日を算出する処理
   const _dateParts = targetDateStr.split('/');
   const _dObj = new Date(Number(_dateParts[0]), Number(_dateParts[1]) - 1, Number(_dateParts[2]));
@@ -110,11 +127,12 @@ function generateScheduleMessage(targetDateStr) {
       const docName = masterData[i][0] ? masterData[i][0].toString().trim() : "";
       const accountId = masterData[i][1] ? masterData[i][1].toString().trim() : "";
       const teamName = masterData[i][2] ? masterData[i][2].toString().trim() : "";
-      if (docName && accountId) {
-        masterMap[docName] = accountId;
-      }
-      if (docName && teamName) {
-        doctorTeamMap[docName] = teamName;
+      
+      // ★変更：正規化した名前をキーとして登録
+      if (docName) {
+        const nName = norm(docName);
+        if (accountId) masterMap[nName] = accountId;
+        if (teamName) doctorTeamMap[nName] = teamName;
       }
     }
   }
@@ -173,15 +191,16 @@ function generateScheduleMessage(targetDateStr) {
       const roleFull = row[2] ? row[2].toString() : "";
       const rawDoctor = row[3] ? row[3].toString().trim() : "";
       const doctorName = rawDoctor ? rawDoctor + " 先生" : "";
+      const nRawDoctor = rawDoctor ? norm(rawDoctor) : ""; // ★正規化
 
       const parts = roleFull.split("_");
       const category = parts[0];       
       const detail = parts[1] || "";   
 
-      // ★追加：ドクターのチームから絵文字を特定する処理
+      // ★変更：正規化した名前で絵文字を特定
       let emoji = "";
-      if (doctorTeamMap[rawDoctor] && teamEmojiMap[doctorTeamMap[rawDoctor]]) {
-        emoji = teamEmojiMap[doctorTeamMap[rawDoctor]];
+      if (doctorTeamMap[nRawDoctor] && teamEmojiMap[doctorTeamMap[nRawDoctor]]) {
+        emoji = teamEmojiMap[doctorTeamMap[nRawDoctor]];
       }
 
       // ★変更：診察室（detail）の前に絵文字を合体
@@ -193,12 +212,13 @@ function generateScheduleMessage(targetDateStr) {
         wrap: true
       };
 
-      if (masterMap[rawDoctor]) {
+      // ★変更：正規化した名前でアカウントIDを特定
+      if (masterMap[nRawDoctor]) {
         textElement.text += " 💬"; 
         textElement.color = "#0066cc"; 
         textElement.action = {
           type: "uri",
-          uri: `https://line.worksmobile.com/message/send?version=28&emailList=${masterMap[rawDoctor]}`
+          uri: `https://line.worksmobile.com/message/send?version=28&emailList=${masterMap[nRawDoctor]}`
         };
       } else {
         textElement.color = "#333333"; 
@@ -397,6 +417,7 @@ function generateScheduleMessage(targetDateStr) {
   };
 }
 
+
 // ＝＝＝ 追加1：メイン機能 初回のチーム選択メッセージ生成関数 ＝＝＝
 function generateTeamListMessage() {
   const ss = SpreadsheetApp.openById(PropertiesService.getScriptProperties().getProperty("SPREADSHEET_ID"));
@@ -482,6 +503,9 @@ function generateTeamListMessage() {
 function generateAddressBookMessage(targetTeam) {
   const ss = SpreadsheetApp.openById(PropertiesService.getScriptProperties().getProperty("SPREADSHEET_ID"));
   
+  // ★追加：表記ゆれ吸収関数
+  const norm = (str) => str.replace(/[  ]/g, "").replace(/[齋斎齊]/g, "斉").replace(/[澤]/g, "沢").replace(/[髙]/g, "高").replace(/[﨑]/g, "崎").replace(/[邊邉]/g, "辺");
+
   // 1. 設定シートから該当チームの絵文字を取得
   let teamEmoji = "";
   const configSheet = ss.getSheetByName("設定");
@@ -518,8 +542,10 @@ function generateAddressBookMessage(targetTeam) {
     records.forEach(row => {
       const roleFull = row[2] ? row[2].toString() : "";
       const rawDoctor = row[3] ? row[3].toString().trim() : ""; // 表示名
+      const nRawDoctor = rawDoctor ? norm(rawDoctor) : ""; // ★正規化
       const parts = roleFull.split("_");
       const category = parts[0]; 
+      const detail = parts[1] || ""; // 【修正】後半（残り番/当直など）も取得
       
       // 拠点名を省略
       let locShort = loc;
@@ -527,12 +553,12 @@ function generateAddressBookMessage(targetTeam) {
       if (loc === "市川") locShort = "市";
       if (loc === "西船") locShort = "西";
 
-      if (!statusMap[rawDoctor]) statusMap[rawDoctor] = []; // ★配列で初期化
+      if (!statusMap[nRawDoctor]) statusMap[nRawDoctor] = []; // ★配列で初期化
 
       // ★変更：同じステータスが重複しないようにチェックしてから追加する関数
       let addStatus = (txt, type) => {
-        if (!statusMap[rawDoctor].some(s => s.text === txt)) {
-          statusMap[rawDoctor].push({ text: txt, type: type });
+        if (!statusMap[nRawDoctor].some(s => s.text === txt)) {
+          statusMap[nRawDoctor].push({ text: txt, type: type });
         }
       };
 
@@ -544,10 +570,34 @@ function generateAddressBookMessage(targetTeam) {
       } else if (category === "回復/救急") {
         addStatus(`回・救`, "KAIKYU");
       } else if (category === "当直") {
-        addStatus(`当直`, "TOUCHOKU");
+        // 【修正】detail（後半）を見て「残り番」と「当直」を区別する
+        if (detail.indexOf("残り番") !== -1) {
+          addStatus(`残り番`, "NOKORIBAN");
+        } else {
+          addStatus(`当直`, "TOUCHOKU");
+        }
       }
     });
   });
+
+  // ▼▼▼【新機能ここから】2.5. 休日スケジュールから当日の休み医師リストを作成 ▼▼▼
+  // 「休日スケジュール」シート：A列=日付, D列=医師名（ドクターマスタA列と同じ表示名想定）
+  const holidayNames = [];
+  const holidaySheet = ss.getSheetByName("休日スケジュール");
+  if (holidaySheet) {
+    const hData = holidaySheet.getDataRange().getValues();
+    for (let i = 1; i < hData.length; i++) {
+      if (!hData[i][0]) continue;
+      const hd = new Date(hData[i][0]);
+      if (isNaN(hd.getTime())) continue;
+      const hdStr = `${hd.getFullYear()}/${String(hd.getMonth()+1).padStart(2, '0')}/${String(hd.getDate()).padStart(2, '0')}`;
+      if (hdStr !== targetDateStr) continue;
+      
+      const hDocName = hData[i][3] ? hData[i][3].toString().trim() : ""; // D列: 医師名
+      if (hDocName) holidayNames.push(norm(hDocName)); // 正規化して格納
+    }
+  }
+  // ▲▲▲【新機能ここまで】▲▲▲
 
   // 3. ドクターマスタから対象チームの先生のみを抽出
   const masterSheet = ss.getSheetByName("ドクターマスタ");
@@ -557,6 +607,7 @@ function generateAddressBookMessage(targetTeam) {
     const masterData = masterSheet.getDataRange().getValues();
     for (let i = 1; i < masterData.length; i++) {
       const dispName = masterData[i][0] ? masterData[i][0].toString().trim() : ""; // A列
+      const nDispName = dispName ? norm(dispName) : ""; // ★正規化
       const accountId = masterData[i][1] ? masterData[i][1].toString().trim() : ""; // B列
       const teamName = masterData[i][2] ? masterData[i][2].toString().trim() : "";  // C列
       const fullName = masterData[i][3] ? masterData[i][3].toString().trim() : "";  // D列
@@ -564,7 +615,17 @@ function generateAddressBookMessage(targetTeam) {
       
       // LINE WORKSアカウントがあり、かつ選択されたチームに所属している場合
       if (accountId && teamName === targetTeam) {
-         let currentStatus = statusMap[dispName] || []; // ★配列で取得
+         let currentStatus = statusMap[nDispName] ? statusMap[nDispName].slice() : []; // ★配列で取得（コピー）
+         
+         // ▼▼▼【新機能】休日判定：完全一致 or 片方がもう片方の先頭に一致（「畠山」と「畠山健次」等の表記ゆれ対応）▼▼▼
+         const isHoliday = nDispName !== "" && holidayNames.some(h => 
+           h === nDispName || h.indexOf(nDispName) === 0 || nDispName.indexOf(h) === 0
+         );
+         if (isHoliday && !currentStatus.some(s => s.text === "[休]")) {
+           currentStatus.unshift({ text: "[休]", type: "KYUJITSU" }); // 先頭に[休]を表示
+         }
+         // ▲▲▲【新機能ここまで】▲▲▲
+         
          docs.push({
              dispName: dispName,
              fullName: fullName,
@@ -623,6 +684,8 @@ function generateAddressBookMessage(targetTeam) {
                  if (st.type === "PM") fontColor = "#e74c3c"; // 赤系
                  if (st.type === "KAIKYU") fontColor = "#27ae60"; // 緑色
                  if (st.type === "TOUCHOKU") fontColor = "#8e44ad"; // 紫色
+                 if (st.type === "NOKORIBAN") fontColor = "#c2185b"; // 【修正】ピンク系（残り番）
+                 if (st.type === "KYUJITSU") fontColor = "#e67e22"; // 【新機能】オレンジ色（休日）
                  
                  // 最後の要素以外は半角スペースを入れて間をあける
                  let textStr = st.text + (index < doc.status.length - 1 ? " " : "");
@@ -841,6 +904,11 @@ function repairPrivateKey(key) {
 }
 
 function getAccessToken(props) {
+  // ★修正：他のBotと同様、アクセストークンをキャッシュして毎回のJWT発行を避ける
+  const cache = CacheService.getScriptCache();
+  const cached = cache.get('LINEWORKS_TOKEN_V3');
+  if (cached) return cached;
+
   const privateKey = repairPrivateKey(props.PRIVATE_KEY);
   const now = Math.floor(Date.now() / 1000);
   const header = { alg: "RS256", typ: "JWT" };
@@ -883,5 +951,6 @@ function getAccessToken(props) {
     throw new Error(text);
   }
 
+  cache.put('LINEWORKS_TOKEN_V3', json.access_token, 3000); // 50分キャッシュ
   return json.access_token;
 }
