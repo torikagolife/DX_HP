@@ -1,0 +1,1402 @@
+/**
+ * LINE WORKS 日程調整さんBot (GAS) ─ LINE WORKSログイン方式
+ *
+ * 【設計】
+ *  - 回答URLは ?event=イベント名 の1本だけ。トークにそのまま転送して使える。
+ *  - URLを開くと LINE WORKS の認証に飛び、戻った時点で本人が確定する。
+ *    → 名前入力もBot操作も不要。
+ *  - 主催者かどうかは creatorId と照合して判定。決定ボタンは主催者だけに出る。
+ *    （サーバー側 decideEventDateWeb でも本人確認するのでURL直叩きも不可）
+ *  - 決定通知・リマインダーは、回答者全員のBotトーク（1対1）に直接届く。
+ *
+ * 【作成フロー】
+ *  イベント名 → 説明 → ⏱所要時間 → 日付 → 時刻（→ 追加 or 完了）
+ *
+ * 【フォームの表示順】
+ *  ① イベント情報 → ② あなたの回答 → ③ みんなの回答 → ④ 日程ごとの集計（決定ボタン）
+ *
+ * 【事前準備】Developer Console の認証アプリに以下を登録
+ *  - Redirect URL : このWebアプリの /exec URL（WEBAPP_URL と完全一致させる）
+ *  - OAuth Scopes : user.read （Botの bot スコープはそのまま）
+ *
+ * 【Eventsシートの列】
+ *  A:EventName B:Dates C:CreatorId D:CreatedAt E:Description
+ *  F:TargetId  G:IsChannel H:DurationMin I:DecidedDate
+ *
+ * 【Answersシートの列】
+ *  A:EventName B:UserName C:Answers D:UpdatedAt E:UserId
+ */
+
+// ===== 初期設定 =====
+const PROPS = PropertiesService.getScriptProperties();
+const CONFIG = {
+  CLIENT_ID: PROPS.getProperty('CLIENT_ID') || "",
+  CLIENT_SECRET: PROPS.getProperty('CLIENT_SECRET') || "",
+  SERVICE_ACCOUNT: PROPS.getProperty('SERVICE_ACCOUNT') || "",
+  PRIVATE_KEY: PROPS.getProperty('PRIVATE_KEY') || "",
+  BOT_ID: PROPS.getProperty('BOT_ID') || "",
+  SPREADSHEET_ID: PROPS.getProperty('SPREADSHEET_ID') || "",
+  WEBAPP_URL: PROPS.getProperty('WEBAPP_URL') || "" // デプロイしたWebアプリの /exec URL
+};
+
+const EVENT_HEADER = ['EventName', 'Dates', 'CreatorId', 'CreatedAt', 'Description', 'TargetId', 'IsChannel', 'DurationMin', 'DecidedDate'];
+const ANSWER_HEADER = ['EventName', 'UserName', 'Answers', 'UpdatedAt', 'UserId'];
+
+const AUTH_URL = 'https://auth.worksmobile.com/oauth2/v2.0/authorize';
+const TOKEN_URL = 'https://auth.worksmobile.com/oauth2/v2.0/token';
+const OAUTH_SCOPE = 'user.read';
+
+// ★所要時間の選択肢（ラベル：分）
+const DURATION_OPTIONS = [
+  { label: '15分', min: 15 },
+  { label: '30分', min: 30 },
+  { label: '45分', min: 45 },
+  { label: '1時間', min: 60 },
+  { label: '1時間30分', min: 90 },
+  { label: '2時間', min: 120 },
+  { label: '3時間', min: 180 },
+  { label: '指定なし', min: 0 }
+];
+
+// ★時刻の選択肢（「終日」は廃止）
+const TIME_OPTIONS = ["8:00", "9:00", "10:00", "11:00", "12:00", "13:00", "14:00", "15:00", "16:00", "17:00", "18:00", "19:00"];
+
+// ===== シート =====
+
+function getSpreadsheet() {
+  if (!CONFIG.SPREADSHEET_ID) return SpreadsheetApp.getActiveSpreadsheet();
+  return SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID.trim());
+}
+
+function initSheets() {
+  const ss = getSpreadsheet();
+
+  let ev = ss.getSheetByName('Events');
+  if (!ev) {
+    ev = ss.insertSheet('Events');
+    ev.appendRow(EVENT_HEADER);
+  } else if (ev.getLastColumn() < EVENT_HEADER.length) {
+    ev.getRange(1, 1, 1, EVENT_HEADER.length).setValues([EVENT_HEADER]);
+  }
+
+  let an = ss.getSheetByName('Answers');
+  if (!an) {
+    an = ss.insertSheet('Answers');
+    an.appendRow(ANSWER_HEADER);
+  } else if (an.getLastColumn() < ANSWER_HEADER.length) {
+    an.getRange(1, 1, 1, ANSWER_HEADER.length).setValues([ANSWER_HEADER]);
+  }
+
+  if (!ss.getSheetByName('Reminders')) {
+    const sheet = ss.insertSheet('Reminders');
+    sheet.appendRow(['EventName', 'Kind', 'TargetId', 'IsChannel', 'Message', 'ScheduledTime']);
+  }
+}
+
+function findEventRow_(eventName) {
+  const data = getSpreadsheet().getSheetByName('Events').getDataRange().getValues();
+  for (let i = 1; i < data.length; i++) {
+    if (String(data[i][0]) === String(eventName)) {
+      return {
+        row: i + 1,
+        eventName: String(data[i][0]),
+        dates: String(data[i][1] || ""),
+        creatorId: String(data[i][2] || ""),
+        description: data[i][4] || "なし",
+        targetId: String(data[i][5] || ""),
+        isChannel: (data[i][6] === true || data[i][6] === "true"),
+        durationMin: parseInt(data[i][7], 10) || 0,
+        decidedDate: String(data[i][8] || "")
+      };
+    }
+  }
+  return null;
+}
+
+function isEventExists(eventName) {
+  return !!findEventRow_(eventName);
+}
+
+function createEvent(eventName, dates, creatorId, description, targetId, isChannel, durationMin) {
+  if (isEventExists(eventName)) {
+    throw new Error("⚠️ そのイベント名は既に存在します！別の名前をご利用ください🙏");
+  }
+  getSpreadsheet().getSheetByName('Events')
+    .appendRow([eventName, dates, creatorId, new Date(), description, targetId, isChannel, durationMin || 0, ""]);
+}
+
+function deleteEvent_(eventName) {
+  const ss = getSpreadsheet();
+  const ev = findEventRow_(eventName);
+  if (ev) ss.getSheetByName('Events').deleteRow(ev.row);
+
+  ['Answers', 'Reminders'].forEach(function(name) {
+    const sheet = ss.getSheetByName(name);
+    if (!sheet) return;
+    const data = sheet.getDataRange().getValues();
+    for (let i = data.length - 1; i >= 1; i--) {
+      if (String(data[i][0]) === String(eventName)) sheet.deleteRow(i + 1);
+    }
+  });
+}
+
+// ===== 所要時間ヘルパー =====
+
+// 「1時間30分」「90」「30分」などを分に変換。判別できなければ null
+function parseDuration_(text) {
+  const t = String(text || '').trim()
+    .replace(/[０-９]/g, s => String.fromCharCode(s.charCodeAt(0) - 0xFEE0));
+
+  if (['指定なし', 'なし', 'スキップ', '未定'].indexOf(t) >= 0) return 0;
+
+  if (/^\d+$/.test(t)) {
+    const n = parseInt(t, 10);
+    return (n >= 0 && n <= 1440) ? n : null;
+  }
+
+  const h = t.match(/(\d+)\s*時間/);
+  const m = t.match(/(\d+)\s*分/);
+  if (!h && !m) return null;
+
+  const total = (h ? parseInt(h[1], 10) * 60 : 0) + (m ? parseInt(m[1], 10) : 0);
+  return (total >= 0 && total <= 1440) ? total : null;
+}
+
+function formatDuration_(min) {
+  const n = parseInt(min, 10) || 0;
+  if (n <= 0) return "";
+  if (n < 60) return `${n}分`;
+  const h = Math.floor(n / 60);
+  const m = n % 60;
+  return m > 0 ? `${h}時間${m}分` : `${h}時間`;
+}
+
+// 決定日時の表示（所要時間があれば終了予定も付ける）
+function buildDecidedLine_(decidedDate, durationMin) {
+  const label = formatDuration_(durationMin);
+  if (!label) return decidedDate;
+
+  const start = parseDateString(decidedDate);
+  if (!start) return `${decidedDate}（所要 ${label}）`;
+
+  const end = new Date(start.getTime() + (parseInt(durationMin, 10) * 60 * 1000));
+  const hh = ('0' + end.getHours()).slice(-2);
+  const mm = ('0' + end.getMinutes()).slice(-2);
+  return `${decidedDate} 〜 ${hh}:${mm}（所要 ${label}）`;
+}
+
+// 回答の保存（userIdで同一人物を判定。旧データは名前で照合）
+function recordAnswer_(eventName, userId, userName, answers) {
+  const ev = findEventRow_(eventName);
+  if (!ev) throw new Error(`イベント「${eventName}」が見つかりません`);
+
+  const expectedCount = ev.dates.split(',').length;
+  if (String(answers).split(',').length !== expectedCount) {
+    throw new Error(`回答の数が候補日時と合いません（候補は ${expectedCount} 個）`);
+  }
+
+  const sheet = getSpreadsheet().getSheetByName('Answers');
+  const data = sheet.getDataRange().getValues();
+  let rowIndex = -1;
+
+  for (let i = 1; i < data.length; i++) {
+    if (String(data[i][0]) !== String(eventName)) continue;
+    const rowUserId = String(data[i][4] || "");
+    if (rowUserId) {
+      if (rowUserId === String(userId)) { rowIndex = i + 1; break; }
+    } else if (String(data[i][1]) === String(userName)) {
+      rowIndex = i + 1; break; // 旧データ（UserIdなし）は名前で拾う
+    }
+  }
+
+  if (rowIndex > -1) {
+    sheet.getRange(rowIndex, 1, 1, 5).setValues([[eventName, userName, answers, new Date(), userId]]);
+    return 'updated';
+  }
+  sheet.appendRow([eventName, userName, answers, new Date(), userId]);
+  return 'created';
+}
+
+function getAnswersOf_(eventName, dates) {
+  const data = getSpreadsheet().getSheetByName('Answers').getDataRange().getValues();
+  const allAnswers = [];
+  const counts = dates.map(() => ({'〇': 0, '△': 0, '×': 0}));
+
+  for (let i = 1; i < data.length; i++) {
+    if (String(data[i][0]) !== String(eventName)) continue;
+    const marks = String(data[i][2]).split(',').map(function(m) { return m.trim(); });
+    allAnswers.push({ name: String(data[i][1]), marks: marks, userId: String(data[i][4] || "") });
+    for (let j = 0; j < marks.length; j++) {
+      if (counts[j] && counts[j][marks[j]] !== undefined) counts[j][marks[j]]++;
+    }
+  }
+  return { allAnswers: allAnswers, counts: counts };
+}
+
+function getSummary(eventName) {
+  const ev = findEventRow_(eventName);
+  if (!ev) throw new Error(`😢 イベント「${eventName}」が見つかりません。`);
+
+  const dates = ev.dates.split(',');
+  const res = getAnswersOf_(eventName, dates);
+  const durLabel = formatDuration_(ev.durationMin);
+
+  let t = `📊 【${eventName}】の回答状況\n\n`;
+  if (ev.description && ev.description !== "なし") t += `📝 ◆ 説明\n${ev.description}\n\n`;
+  if (durLabel) t += `⏱ ◆ 予想所要時間\n${durLabel}\n\n`;
+  if (ev.decidedDate) t += `🎉 ◆ 決定済み\n${buildDecidedLine_(ev.decidedDate, ev.durationMin)}\n\n`;
+  t += `👥 ◆ 回答者（${res.allAnswers.length}人）\n`;
+  t += res.allAnswers.length > 0
+    ? res.allAnswers.map(function(a) { return `${a.name}: ${a.marks.join(' ')}`; }).join('\n')
+    : "まだ回答がありません💦";
+  t += `\n\n🎯 ◆ 日程ごとの集計\n`;
+  for (let i = 0; i < dates.length; i++) {
+    t += `${dates[i]}\n 〇${res.counts[i]['〇']} △${res.counts[i]['△']} ×${res.counts[i]['×']}\n`;
+  }
+  return t;
+}
+
+// ===== 共有メッセージ =====
+
+function buildAnswerUrl_(eventName) {
+  return `${CONFIG.WEBAPP_URL}?event=${encodeURIComponent(eventName)}`;
+}
+
+// ★そのまま転送して使えるプレーンテキスト
+function buildShareMessage_(eventName, description, dates, durationMin) {
+  const durLabel = formatDuration_(durationMin);
+  let t = `📅 【${eventName}】日程調整のお願い\n\n`;
+  if (description && description !== "なし") t += `📝 ${description}\n`;
+  if (durLabel) t += `⏱ 予想所要時間：${durLabel}\n`;
+  t += `\n◆ 候補日時\n${dates.join('\n')}\n\n`;
+  t += `▼ 下のURLを開いて出欠（〇△×）をご回答ください\n`;
+  t += buildAnswerUrl_(eventName);
+  t += `\n\n※LINE WORKSのログイン確認が出たら承認してください。お名前の入力は不要です。`;
+  return t;
+}
+
+// ===== LINE WORKS API（Bot用 / Service Account認証）=====
+
+function repairPrivateKey(key) {
+  if (!key) return "";
+  const header = "-----BEGIN PRIVATE KEY-----";
+  const footer = "-----END PRIVATE KEY-----";
+  let normalizedKey = key.replace(/\\n/g, '\n').replace(/\\r/g, '');
+  if (normalizedKey.indexOf(header) !== -1 && normalizedKey.indexOf(footer) !== -1) {
+    let body = normalizedKey.substring(normalizedKey.indexOf(header) + header.length, normalizedKey.indexOf(footer));
+    body = body.replace(/\s+/g, '');
+    let formattedBody = body.match(/.{1,64}/g).join('\n');
+    return header + '\n' + formattedBody + '\n' + footer;
+  }
+  return key;
+}
+
+function getAccessToken() {
+  const cache = CacheService.getScriptCache();
+  const token = cache.get('LINEWORKS_TOKEN_V3');
+  if (token) return token;
+
+  const privateKey = repairPrivateKey(CONFIG.PRIVATE_KEY);
+  const now = Math.floor(Date.now() / 1000);
+  const header = { alg: "RS256", typ: "JWT" };
+  const payload = {
+    iss: CONFIG.CLIENT_ID.trim(),
+    sub: CONFIG.SERVICE_ACCOUNT.trim(),
+    iat: now,
+    exp: now + 3600
+  };
+
+  const encodedHeader = Utilities.base64EncodeWebSafe(JSON.stringify(header));
+  const encodedPayload = Utilities.base64EncodeWebSafe(JSON.stringify(payload));
+  const signingInput = encodedHeader + "." + encodedPayload;
+  const signatureBytes = Utilities.computeRsaSha256Signature(signingInput, privateKey);
+  const jwt = signingInput + "." + Utilities.base64EncodeWebSafe(signatureBytes);
+
+  const response = UrlFetchApp.fetch(TOKEN_URL, {
+    method: "post",
+    payload: {
+      assertion: jwt,
+      grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
+      client_id: CONFIG.CLIENT_ID.trim(),
+      client_secret: CONFIG.CLIENT_SECRET.trim(),
+      scope: "bot,user.read"
+    },
+    muteHttpExceptions: true
+  });
+
+  const text = response.getContentText();
+  if (!text.startsWith("{")) throw new Error("Token取得失敗: " + text);
+  const json = JSON.parse(text);
+  if (!json.access_token) throw new Error(text);
+
+  cache.put('LINEWORKS_TOKEN_V3', json.access_token, 3000);
+  return json.access_token;
+}
+
+function getUserName(userId) {
+  if (!userId) return "メンバー";
+  const response = UrlFetchApp.fetch("https://www.worksapis.com/v1.0/users/" + encodeURIComponent(userId), {
+    method: "get",
+    headers: { Authorization: "Bearer " + getAccessToken() },
+    muteHttpExceptions: true
+  });
+  if (response.getResponseCode() !== 200) return "メンバー";
+  return extractName_(JSON.parse(response.getContentText()), userId);
+}
+
+function extractName_(json, fallback) {
+  if (json.userName) {
+    const full = ((json.userName.lastName || "") + " " + (json.userName.firstName || "")).trim();
+    if (full) return full;
+  }
+  const email = json.email || json.externalEmail || json.userEmail || "";
+  if (email) return email.split('@')[0];
+  return fallback || "メンバー";
+}
+
+function sendWorksMessage(targetId, isChannel, contentObject) {
+  const token = getAccessToken();
+  const url = isChannel
+    ? `https://www.worksapis.com/v1.0/bots/${CONFIG.BOT_ID.trim()}/channels/${targetId}/messages`
+    : `https://www.worksapis.com/v1.0/bots/${CONFIG.BOT_ID.trim()}/users/${targetId}/messages`;
+
+  const response = UrlFetchApp.fetch(url, {
+    method: 'post',
+    headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+    payload: JSON.stringify({ content: contentObject }),
+    muteHttpExceptions: true
+  });
+  const code = response.getResponseCode();
+  if (code !== 200 && code !== 201) {
+    console.error("Message送信失敗(" + code + "): " + response.getContentText());
+    return false;
+  }
+  return true;
+}
+
+function sendText_(targetId, isChannel, text) {
+  return sendWorksMessage(targetId, isChannel, { type: "text", text: text });
+}
+
+// ===== User Account認証（OAuth 2.0）=====
+
+// 認可URLを作る。stateにイベント名を紐づけてキャッシュへ。
+function buildAuthorizeUrl_(eventName) {
+  const state = Utilities.getUuid().replace(/-/g, '');
+  CacheService.getScriptCache().put('oauth_state_' + state, eventName, 600); // 10分
+
+  const params = [
+    'client_id=' + encodeURIComponent(CONFIG.CLIENT_ID.trim()),
+    'redirect_uri=' + encodeURIComponent(CONFIG.WEBAPP_URL),
+    'scope=' + encodeURIComponent(OAUTH_SCOPE),
+    'response_type=code',
+    'state=' + encodeURIComponent(state)
+  ];
+  return AUTH_URL + '?' + params.join('&');
+}
+
+// 認可コード → アクセストークン
+function exchangeCodeForToken_(code) {
+  const response = UrlFetchApp.fetch(TOKEN_URL, {
+    method: 'post',
+    payload: {
+      grant_type: 'authorization_code',
+      code: code,
+      client_id: CONFIG.CLIENT_ID.trim(),
+      client_secret: CONFIG.CLIENT_SECRET.trim(),
+      redirect_uri: CONFIG.WEBAPP_URL
+    },
+    muteHttpExceptions: true
+  });
+  const text = response.getContentText();
+  if (!text.startsWith('{')) throw new Error('トークン取得に失敗しました: ' + text);
+  const json = JSON.parse(text);
+  if (!json.access_token) throw new Error('トークン取得に失敗しました: ' + text);
+  return json.access_token;
+}
+
+// アクセストークンで本人情報を取得
+function fetchMe_(accessToken) {
+  const response = UrlFetchApp.fetch('https://www.worksapis.com/v1.0/users/me', {
+    method: 'get',
+    headers: { Authorization: 'Bearer ' + accessToken },
+    muteHttpExceptions: true
+  });
+  if (response.getResponseCode() !== 200) {
+    throw new Error('メンバー情報の取得に失敗しました: ' + response.getContentText());
+  }
+  const json = JSON.parse(response.getContentText());
+  const userId = json.userId || json.id || "";
+  if (!userId) throw new Error('メンバーIDが取得できませんでした');
+  return { userId: String(userId), userName: extractName_(json, String(userId)) };
+}
+
+// ログインセッション（本人情報のみキャッシュ。アクセストークンは保持しない）
+function createSession_(me) {
+  const sid = Utilities.getUuid().replace(/-/g, '');
+  CacheService.getScriptCache().put('sess_' + sid, JSON.stringify(me), 21600); // 6時間
+  return sid;
+}
+
+function readSession_(sid) {
+  if (!sid) return null;
+  const raw = CacheService.getScriptCache().get('sess_' + sid);
+  if (!raw) return null;
+  try { return JSON.parse(raw); } catch (err) { return null; }
+}
+
+// クライアントから呼ばれる入口。ログイン済みならフォームデータ、未ログインなら認可URLを返す。
+function bootstrap(eventName, sid) {
+  const ev = findEventRow_(eventName);
+  if (!ev || !ev.dates) return { error: "⚠️ イベントが見つかりません。削除された可能性があります。" };
+
+  const dates = ev.dates.split(',');
+  const base = {
+    eventName: ev.eventName,
+    creatorName: getUserName(ev.creatorId),
+    description: ev.description,
+    durationLabel: formatDuration_(ev.durationMin),
+    decidedDate: ev.decidedDate,
+    decidedLine: ev.decidedDate ? buildDecidedLine_(ev.decidedDate, ev.durationMin) : "",
+    dates: dates
+  };
+
+  const me = readSession_(sid);
+  if (!me) {
+    if (!CONFIG.WEBAPP_URL) return { error: "🚨 WEBAPP_URLが未設定です。管理者にご連絡ください。" };
+    base.needLogin = true;
+    base.authUrl = buildAuthorizeUrl_(eventName);
+    return base;
+  }
+
+  const res = getAnswersOf_(eventName, dates);
+  let myAnswers = null;
+  res.allAnswers.forEach(function(a) {
+    if (a.userId === me.userId || (!a.userId && a.name === me.userName)) myAnswers = a.marks;
+  });
+
+  base.needLogin = false;
+  base.me = me;
+  base.isCreator = (String(me.userId) === String(ev.creatorId));
+  base.allAnswers = res.allAnswers.map(function(a) { return { name: a.name, marks: a.marks }; });
+  base.counts = res.counts;
+  base.myAnswers = myAnswers;
+  return base;
+}
+
+// ===== Web App =====
+
+function doGet(e) {
+  const p = (e && e.parameter) ? e.parameter : {};
+
+  // --- OAuthのコールバック ---
+  if (p.code && p.state) {
+    const eventName = CacheService.getScriptCache().get('oauth_state_' + p.state);
+    if (!eventName) {
+      return renderShell_("", "", "⚠️ ログインの有効期限が切れました。お手数ですが、共有されたURLをもう一度開いてください。");
+    }
+    try {
+      const me = fetchMe_(exchangeCodeForToken_(p.code));
+      return renderShell_(eventName, createSession_(me), "");
+    } catch (err) {
+      return renderShell_(eventName, "", "🚨 ログインに失敗しました。\n" + err.message);
+    }
+  }
+
+  if (p.error) {
+    return renderShell_(p.event || "", "", "🚨 ログインがキャンセルされました。もう一度お試しください。");
+  }
+
+  if (!p.event) {
+    return renderShell_("", "", "🚨 URLが正しくありません。共有されたリンクから開き直してください。");
+  }
+
+  return renderShell_(p.event, p.sid || "", "");
+}
+
+function toMobileOutput_(html) {
+  return HtmlService.createHtmlOutput(html)
+    .setTitle('日程調整さん')
+    .addMetaTag('viewport', 'width=device-width, initial-scale=1');
+}
+
+function renderShell_(eventName, sid, fatalMessage) {
+  let html = `<!DOCTYPE html><html lang="ja"><head><meta charset="UTF-8">`;
+  html += `<style>
+    * { box-sizing: border-box; }
+    html { -webkit-text-size-adjust: 100%; }
+    body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, 'Hiragino Sans', 'Hiragino Kaku Gothic ProN', 'Noto Sans JP', Meiryo, sans-serif; font-size: 16px; line-height: 1.6; background: #f2f4f7; color: #222; -webkit-tap-highlight-color: rgba(0,0,0,0.05); }
+    .wrap { max-width: 640px; margin: 0 auto; padding: 12px 12px calc(100px + env(safe-area-inset-bottom)); }
+    .card { background: #fff; border-radius: 14px; padding: 16px; margin-bottom: 14px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+    .loading { text-align: center; padding: 60px 0; color: #666; }
+    .error-card { color: #d9534f; font-weight: bold; text-align: center; padding: 24px 16px; white-space: pre-wrap; }
+    .muted { color: #888; font-size: 0.9em; }
+    .small { font-size: 0.82em; }
+
+    .ev-title { font-size: 1.35em; font-weight: bold; color: #036ce1; margin-bottom: 8px; word-break: break-word; line-height: 1.4; }
+    .ev-meta { font-size: 0.95em; color: #555; }
+    .ev-desc { margin-top: 10px; padding: 10px 12px; background: #f7f8fa; border-radius: 10px; white-space: pre-wrap; word-break: break-word; font-size: 0.95em; }
+    .decided { margin-top: 10px; padding: 10px 12px; background: #e9f7ec; border: 1px solid #b8e2c3; border-radius: 10px; font-weight: bold; color: #1e7e34; }
+    .sec-title { font-size: 1.1em; font-weight: bold; margin-bottom: 12px; padding-left: 10px; border-left: 4px solid #036ce1; line-height: 1.3; }
+
+    /* ログイン画面 */
+    .login-box { text-align: center; padding: 8px 0 4px; }
+    .login-box .lead { font-weight: bold; margin-bottom: 4px; }
+    .date-list { text-align: left; background: #f7f8fa; border-radius: 10px; padding: 12px 14px; margin: 12px 0; }
+    .date-list div { padding: 3px 0; }
+    .login-btn { display: block; width: 100%; padding: 16px; font-size: 1.1em; font-weight: bold; background: #036ce1; color: #fff; border: none; border-radius: 12px; -webkit-appearance: none; touch-action: manipulation; }
+    .login-btn:active { background: #024a9c; }
+
+    .sum-item { padding: 12px 0; border-bottom: 1px solid #eee; }
+    .sum-item:last-child { border-bottom: none; padding-bottom: 0; }
+    .sum-date { font-weight: bold; font-size: 1.05em; }
+    .sum-item.best .sum-date::after { content: ' 👑'; }
+    .sum-counts { display: flex; gap: 16px; margin-top: 2px; }
+    .bar { height: 8px; background: #eef0f3; border-radius: 4px; margin-top: 6px; overflow: hidden; }
+    .bar > div { height: 100%; background: #036ce1; border-radius: 4px; }
+    .decide-btn { display: block; width: 100%; margin-top: 10px; padding: 12px; font-size: 1em; font-weight: bold; background: #28a745; color: #fff; border: none; border-radius: 10px; -webkit-appearance: none; touch-action: manipulation; }
+    .decide-btn:active { background: #218838; }
+    .decide-btn:disabled { background: #9fd3ab; }
+
+    .mark-o { color: #007bff; font-weight: bold; }
+    .mark-d { color: #28a745; font-weight: bold; }
+    .mark-x { color: #dc3545; font-weight: bold; }
+
+    .table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; margin: 0 -16px; padding: 0 16px; }
+    table { border-collapse: separate; border-spacing: 0; min-width: 100%; font-size: 0.95em; }
+    th, td { border-bottom: 1px solid #e5e7eb; padding: 10px 12px; text-align: center; white-space: nowrap; background: #fff; }
+    th { background: #f7f8fa; font-size: 0.82em; line-height: 1.35; font-weight: bold; }
+    td.mark-o, td.mark-d, td.mark-x { font-size: 1.2em; }
+    .sticky { position: sticky; left: 0; z-index: 1; text-align: left; font-weight: bold; box-shadow: 2px 0 0 #e5e7eb; max-width: 8em; overflow: hidden; text-overflow: ellipsis; }
+    th.sticky { z-index: 2; background: #f7f8fa; }
+    .total-row td { background: #eef5ff; font-weight: bold; }
+    .me-row td { background: #fffbe6; }
+    .hint { text-align: center; margin-top: 8px; }
+
+    .user-info { padding: 10px 12px; background: #eef5ff; border-radius: 10px; margin-bottom: 12px; }
+    .bulk { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-bottom: 4px; }
+    .bulk-btn { padding: 6px 12px; font-size: 0.9em; border: 1px solid #d0d5dc; background: #fff; border-radius: 16px; color: #444; -webkit-appearance: none; touch-action: manipulation; }
+    .q-item { padding: 14px 0; border-bottom: 1px solid #eee; }
+    .q-item:last-child { border-bottom: none; }
+    .q-date { font-weight: bold; font-size: 1.05em; margin-bottom: 10px; }
+
+    .seg { display: flex; gap: 8px; }
+    .seg-btn { flex: 1; display: block; padding: 14px 0; font-size: 1.5em; font-weight: bold; line-height: 1.1; border: 2px solid #d0d5dc; border-radius: 12px; color: #b5bac1; background: #fff; -webkit-appearance: none; appearance: none; -webkit-tap-highlight-color: transparent; touch-action: manipulation; transition: background 0.12s, border-color 0.12s, color 0.12s; }
+    .seg-btn.sel.o { border-color: #007bff; background: #e8f1ff; color: #007bff; }
+    .seg-btn.sel.d { border-color: #28a745; background: #e9f7ec; color: #28a745; }
+    .seg-btn.sel.x { border-color: #dc3545; background: #fdecee; color: #dc3545; }
+    #message { margin-top: 12px; font-weight: bold; text-align: center; color: #d9534f; }
+
+    .submit-bar { position: fixed; left: 0; right: 0; bottom: 0; padding: 10px 12px calc(10px + env(safe-area-inset-bottom)); background: rgba(255,255,255,0.96); box-shadow: 0 -2px 8px rgba(0,0,0,0.08); z-index: 500; }
+    .submit-btn { display: block; width: 100%; max-width: 640px; margin: 0 auto; padding: 16px; font-size: 1.1em; font-weight: bold; background: #036ce1; color: #fff; border: none; border-radius: 12px; -webkit-appearance: none; touch-action: manipulation; }
+    .submit-btn:active { background: #024a9c; }
+    .submit-btn:disabled { background: #9bb8dd; }
+
+    .done { text-align: center; padding: 40px 16px; }
+    .done .big { font-size: 3.2em; line-height: 1.2; }
+    .done h2 { font-size: 1.3em; margin: 10px 0; color: #036ce1; }
+
+    .modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.45); z-index: 1000; }
+    .modal.show { display: flex; align-items: flex-end; justify-content: center; }
+    .modal-content { background: #fff; width: 100%; max-width: 640px; border-radius: 18px 18px 0 0; padding: 20px 16px calc(16px + env(safe-area-inset-bottom)); max-height: 90vh; overflow-y: auto; }
+    @media (min-width: 700px) { .modal.show { align-items: center; } .modal-content { border-radius: 18px; } }
+    .modal-header { font-size: 1.15em; font-weight: bold; margin-bottom: 12px; padding-bottom: 10px; border-bottom: 1px solid #eee; }
+    .modal-date { font-weight: bold; font-size: 1.05em; color: #036ce1; margin: 0 0 8px; }
+    .rm-btn { display: block; width: 100%; text-align: left; padding: 14px; border: 2px solid #e0e4ea; border-radius: 12px; margin-bottom: 8px; font-size: 1.05em; background: #fff; color: #333; -webkit-appearance: none; touch-action: manipulation; }
+    .rm-btn.sel { border-color: #036ce1; background: #eef5ff; color: #036ce1; font-weight: bold; }
+    .modal-footer { display: flex; gap: 10px; margin-top: 14px; }
+    .btn { flex: 1; padding: 14px; font-size: 1em; border: none; border-radius: 12px; font-weight: bold; -webkit-appearance: none; touch-action: manipulation; }
+    .btn-primary { background: #036ce1; color: #fff; }
+    .btn-secondary { background: #e4e6ea; color: #333; }
+
+    .toast { display: none; position: fixed; left: 50%; bottom: calc(96px + env(safe-area-inset-bottom)); transform: translateX(-50%); background: rgba(30,30,30,0.92); color: #fff; padding: 12px 20px; border-radius: 24px; font-size: 0.95em; z-index: 2000; max-width: 90%; text-align: center; }
+  </style></head><body>`;
+
+  html += `<div class="wrap"><div id="app"><div class="loading">⏳ 読み込んでいます...</div></div></div>`;
+  html += `<div id="toast" class="toast"></div>`;
+
+  html += `
+  <div id="reminderModal" class="modal">
+    <div class="modal-content">
+      <div class="modal-header">🔔 日程の決定・リマインダー設定</div>
+      <p id="modalDateText" class="modal-date"></p>
+      <p style="margin:0;">回答者全員にリマインドを送りますか？</p>
+      <div style="margin-top:10px;">
+        <button type="button" class="rm-btn sel" data-min="0">なし</button>
+        <button type="button" class="rm-btn" data-min="15">15分前</button>
+        <button type="button" class="rm-btn" data-min="30">30分前</button>
+        <button type="button" class="rm-btn" data-min="60">1時間前</button>
+        <button type="button" class="rm-btn" data-min="1440">1日前</button>
+      </div>
+      <p class="muted small">※通知は各自のBotトークに届きます。</p>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-secondary" id="modalCancel">キャンセル</button>
+        <button type="button" class="btn btn-primary" id="modalOk">決定して通知</button>
+      </div>
+    </div>
+  </div>`;
+
+  html += `<script>
+    const EVENT_NAME = ${JSON.stringify(eventName).replace(/</g, '\\u003c')};
+    const INITIAL_SID = ${JSON.stringify(sid).replace(/</g, '\\u003c')};
+    const FATAL = ${JSON.stringify(fatalMessage).replace(/</g, '\\u003c')};
+    const MARKS = ['〇', '△', '×'];
+    const SID_KEY = 'nittei_sid';
+
+    let sid = "";
+    let formData = null;
+    let myAnswers = [];
+    let selectedDateForDecision = "";
+    let reminderMin = 0;
+
+    function esc(s) {
+      return String(s == null ? '' : s)
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    }
+    function getStoredSid() { try { return localStorage.getItem(SID_KEY) || ''; } catch (e) { return ''; } }
+    function setStoredSid(v) { try { localStorage.setItem(SID_KEY, v); } catch (e) {} }
+
+    function showToast(msg, ms) {
+      const t = document.getElementById('toast');
+      t.textContent = msg;
+      t.style.display = 'block';
+      clearTimeout(showToast._timer);
+      showToast._timer = setTimeout(function() { t.style.display = 'none'; }, ms || 3000);
+    }
+    function fatal(msg) {
+      document.getElementById('app').innerHTML = '<div class="card error-card">' + esc(msg) + '</div>';
+    }
+    function onError(err) {
+      const msg = (err && err.message) ? err.message : String(err);
+      showToast('🚨 ' + msg, 6000);
+      const b = document.getElementById('submitBtn'); if (b) b.disabled = false;
+      const m = document.getElementById('message'); if (m) m.textContent = '';
+      document.querySelectorAll('.decide-btn').forEach(function(x) { x.disabled = false; });
+    }
+    function markClass(m) { return m === '〇' ? 'mark-o' : (m === '△' ? 'mark-d' : (m === '×' ? 'mark-x' : '')); }
+    function markKey(m) { return m === '〇' ? 'o' : (m === '△' ? 'd' : 'x'); }
+
+    // ★イベント情報カード（ログイン前後で共通）
+    function eventInfoCard(data) {
+      let h = '<div class="card">';
+      h += '<div class="ev-title">📅 ' + esc(data.eventName) + '</div>';
+      h += '<div class="ev-meta">👤 主催：' + esc(data.creatorName) + '</div>';
+      if (data.durationLabel) {
+        h += '<div class="ev-meta">⏱ 予想所要時間：' + esc(data.durationLabel) + '</div>';
+      }
+      h += '<div class="ev-desc">📝 ' + esc(data.description) + '</div>';
+      if (data.decidedDate) {
+        h += '<div class="decided">🎉 決定：' + esc(data.decidedLine || data.decidedDate) + '</div>';
+      }
+      h += '</div>';
+      return h;
+    }
+
+    // 起動
+    if (FATAL) {
+      fatal(FATAL);
+    } else {
+      sid = INITIAL_SID || getStoredSid();
+      if (INITIAL_SID) setStoredSid(INITIAL_SID);
+      google.script.run
+        .withSuccessHandler(render)
+        .withFailureHandler(function(err) { fatal('🚨 読み込みに失敗しました\\n' + (err && err.message ? err.message : err)); })
+        .bootstrap(EVENT_NAME, sid);
+    }
+
+    function render(data) {
+      if (data.error) { fatal(data.error); return; }
+      formData = data;
+      if (data.needLogin) { renderLogin(data); return; }
+      renderForm(data);
+    }
+
+    // ---- 未ログイン：イベント内容＋ログインボタン ----
+    function renderLogin(data) {
+      let h = eventInfoCard(data);
+
+      h += '<div class="card"><div class="login-box">';
+      h += '<p class="lead">候補日時</p>';
+      h += '<div class="date-list">';
+      data.dates.forEach(function(d) { h += '<div>・' + esc(d) + '</div>'; });
+      h += '</div>';
+      h += '<p class="muted small">回答にはLINE WORKSの確認が必要です。<br>お名前の入力は不要です。</p>';
+      h += '<button type="button" id="loginBtn" class="login-btn" style="margin-top:14px;">🔐 LINE WORKSで続ける</button>';
+      h += '</div></div>';
+      document.getElementById('app').innerHTML = h;
+
+      // ★GASはiframe内で動くため、window.top を書き換えて外に出る（ユーザー操作が必須）
+      document.getElementById('loginBtn').addEventListener('click', function() {
+        this.disabled = true;
+        this.textContent = '⏳ 移動しています...';
+        try {
+          window.top.location.href = data.authUrl;
+        } catch (err) {
+          window.open(data.authUrl, '_blank');
+        }
+      });
+    }
+
+    // ---- ログイン済み：本体 ----
+    // 表示順：① イベント情報 → ② あなたの回答 → ③ みんなの回答 → ④ 日程ごとの集計
+    function renderForm(data) {
+      const total = data.allAnswers.length;
+      myAnswers = data.dates.map(function(d, i) {
+        const v = data.myAnswers ? String(data.myAnswers[i] || '').trim() : '';
+        return MARKS.indexOf(v) >= 0 ? v : '〇';
+      });
+
+      let maxO = 0;
+      data.counts.forEach(function(c) { if (c['〇'] > maxO) maxO = c['〇']; });
+
+      // ======== ① イベント情報 ========
+      let h = eventInfoCard(data);
+
+      // ======== ② あなたの回答 ========
+      h += '<div class="card"><div class="sec-title">✍️ あなたの回答</div>';
+      h += '<div class="user-info">👤 ' + esc(data.me.userName) + ' さん'
+         + (data.myAnswers ? '<span class="muted small">（回答済み・修正できます）</span>' : '') + '</div>';
+      h += '<div class="bulk"><span class="muted small">まとめて：</span>'
+         + '<button type="button" class="bulk-btn" data-mark="〇">全部〇</button>'
+         + '<button type="button" class="bulk-btn" data-mark="△">全部△</button>'
+         + '<button type="button" class="bulk-btn" data-mark="×">全部×</button></div>';
+      h += '<div id="ansList">';
+      data.dates.forEach(function(d, i) {
+        h += '<div class="q-item"><div class="q-date">' + esc(d) + '</div><div class="seg">';
+        MARKS.forEach(function(m) {
+          const sel = (myAnswers[i] === m) ? ' sel' : '';
+          h += '<button type="button" class="seg-btn ' + markKey(m) + sel + '" data-idx="' + i + '" data-mark="' + m + '">' + m + '</button>';
+        });
+        h += '</div></div>';
+      });
+      h += '</div><div id="message"></div></div>';
+
+      // ======== ③ みんなの回答 ========
+      h += '<div class="card"><div class="sec-title">👥 みんなの回答</div>';
+      if (total > 0) {
+        h += '<div class="table-wrap"><table><thead><tr><th class="sticky">名前</th>';
+        data.dates.forEach(function(d) { h += '<th>' + esc(d).replace(' ', '<br>') + '</th>'; });
+        h += '</tr></thead><tbody>';
+        data.allAnswers.forEach(function(ans) {
+          const me = (ans.name === data.me.userName) ? ' class="me-row"' : '';
+          h += '<tr' + me + '><td class="sticky">' + esc(ans.name) + '</td>';
+          ans.marks.forEach(function(m) {
+            m = String(m).trim();
+            h += '<td class="' + markClass(m) + '">' + esc(m) + '</td>';
+          });
+          h += '</tr>';
+        });
+        h += '<tr class="total-row"><td class="sticky">〇の数</td>';
+        data.counts.forEach(function(c) { h += '<td>' + c['〇'] + '人</td>'; });
+        h += '</tr></tbody></table></div>';
+        if (data.dates.length > 2) h += '<div class="muted small hint">← 横にスクロールできます →</div>';
+      } else {
+        h += '<p class="muted" style="margin:0;">まだ回答がありません💦</p>';
+      }
+      h += '</div>';
+
+      // ======== ④ 日程ごとの集計（★決定ボタンは主催者のみ描画）========
+      h += '<div class="card"><div class="sec-title">📊 日程ごとの集計（' + total + '人回答）</div>';
+      data.dates.forEach(function(d, i) {
+        const c = data.counts[i];
+        const pct = total > 0 ? Math.round(c['〇'] / total * 100) : 0;
+        const best = (maxO > 0 && c['〇'] === maxO) ? ' best' : '';
+        h += '<div class="sum-item' + best + '">';
+        h += '<div class="sum-date">' + esc(d) + '</div>';
+        h += '<div class="sum-counts"><span class="mark-o">〇 ' + c['〇'] + '</span><span class="mark-d">△ ' + c['△'] + '</span><span class="mark-x">× ' + c['×'] + '</span></div>';
+        h += '<div class="bar"><div style="width:' + pct + '%"></div></div>';
+        if (data.isCreator) h += '<button type="button" class="decide-btn" data-idx="' + i + '">✅ この日程で決定</button>';
+        h += '</div>';
+      });
+      if (!data.isCreator) h += '<p class="muted small" style="margin:12px 0 0;">※日程の決定は主催者が行います。</p>';
+      h += '</div>';
+
+      h += '<div class="submit-bar"><button type="button" id="submitBtn" class="submit-btn">🚀 この内容で回答する</button></div>';
+
+      document.getElementById('app').innerHTML = h;
+    }
+
+    function setMark(idx, mark) {
+      if (MARKS.indexOf(mark) < 0) return;
+      myAnswers[idx] = mark;
+      document.querySelectorAll('.seg-btn[data-idx="' + idx + '"]').forEach(function(b) {
+        if (b.dataset.mark === mark) b.classList.add('sel'); else b.classList.remove('sel');
+      });
+    }
+    function setAll(mark) { for (let i = 0; i < myAnswers.length; i++) setMark(i, mark); }
+
+    function submitForm() {
+      if (!formData) return;
+      document.getElementById('message').textContent = '⏳ 送信中...';
+      const btn = document.getElementById('submitBtn');
+      if (btn) btn.disabled = true;
+
+      google.script.run
+        .withSuccessHandler(function(res) {
+          document.getElementById('app').innerHTML =
+            '<div class="card done"><div class="big">✅</div><h2>回答ありがとうございました</h2>' +
+            '<p>回答を' + (res === 'updated' ? '更新' : '登録') + 'しました。<br>この画面は閉じて大丈夫です✨</p>' +
+            '<button type="button" class="submit-btn" style="margin-top:20px;" onclick="location.reload()">集計を見る</button></div>';
+          const bar = document.querySelector('.submit-bar');
+          if (bar) bar.remove();
+          window.scrollTo(0, 0);
+        })
+        .withFailureHandler(onError)
+        .submitAnswerWeb(EVENT_NAME, sid, myAnswers.join(','));
+    }
+
+    function openModal(dateStr) {
+      selectedDateForDecision = dateStr;
+      reminderMin = 0;
+      document.querySelectorAll('.rm-btn').forEach(function(b) {
+        if (b.dataset.min === '0') b.classList.add('sel'); else b.classList.remove('sel');
+      });
+      let label = '📅 決定日時: ' + dateStr;
+      if (formData.durationLabel) label += '（所要 ' + formData.durationLabel + '）';
+      document.getElementById('modalDateText').textContent = label;
+      document.getElementById('reminderModal').classList.add('show');
+      document.body.style.overflow = 'hidden';
+    }
+    function closeModal() {
+      document.getElementById('reminderModal').classList.remove('show');
+      document.body.style.overflow = '';
+      selectedDateForDecision = "";
+    }
+    function executeDecide() {
+      if (!selectedDateForDecision) return;
+      const targetDateStr = selectedDateForDecision;
+      const min = reminderMin;
+      closeModal();
+      showToast('⏳ 通知を送信しています...', 15000);
+      document.querySelectorAll('.decide-btn').forEach(function(b) { b.disabled = true; });
+
+      google.script.run
+        .withSuccessHandler(function(res) {
+          showToast('🎉 ' + res.sent + '人に決定を通知しました');
+          const idx = formData.dates.indexOf(targetDateStr);
+          document.querySelectorAll('.decide-btn').forEach(function(b) {
+            b.disabled = false;
+            if (Number(b.dataset.idx) === idx) b.textContent = '🎉 決定済み';
+          });
+        })
+        .withFailureHandler(onError)
+        .decideEventDateWeb(EVENT_NAME, sid, targetDateStr, min);
+    }
+
+    document.addEventListener('click', function(ev) {
+      if (ev.target.id === 'reminderModal') { closeModal(); return; }
+      const el = ev.target.closest ? ev.target.closest('button') : null;
+      if (!el) return;
+
+      if (el.classList.contains('seg-btn')) { setMark(Number(el.dataset.idx), el.dataset.mark); return; }
+      if (el.classList.contains('bulk-btn')) { setAll(el.dataset.mark); return; }
+      if (el.id === 'submitBtn') { submitForm(); return; }
+      if (el.classList.contains('decide-btn')) { openModal(formData.dates[Number(el.dataset.idx)]); return; }
+      if (el.classList.contains('rm-btn')) {
+        reminderMin = parseInt(el.dataset.min, 10) || 0;
+        document.querySelectorAll('.rm-btn').forEach(function(b) { b.classList.remove('sel'); });
+        el.classList.add('sel');
+        return;
+      }
+      if (el.id === 'modalCancel') { closeModal(); return; }
+      if (el.id === 'modalOk') { executeDecide(); return; }
+    });
+  </script></body></html>`;
+
+  return toMobileOutput_(html);
+}
+
+// ===== クライアントから呼ばれるサーバー処理 =====
+
+function submitAnswerWeb(eventName, sid, answersStr) {
+  const me = readSession_(sid);
+  if (!me) throw new Error("ログインの有効期限が切れました。画面を再読み込みしてください");
+
+  const result = recordAnswer_(eventName, me.userId, me.userName, answersStr);
+
+  // 主催者に通知
+  const ev = findEventRow_(eventName);
+  if (ev && ev.targetId && String(ev.creatorId) !== String(me.userId)) {
+    const res = getAnswersOf_(eventName, ev.dates.split(','));
+    const verb = (result === 'updated') ? '回答を修正' : '回答';
+    sendText_(ev.targetId, ev.isChannel,
+      `📩 【${eventName}】\n${me.userName}さんが${verb}しました（計${res.allAnswers.length}人）\n\n${String(answersStr).split(',').join(' ')}\n\n「確認 ${eventName}」で集計を見られます📊`);
+  }
+  return result;
+}
+
+function decideEventDateWeb(eventName, sid, decidedDate, reminderMinutes) {
+  const me = readSession_(sid);
+  if (!me) throw new Error("ログインの有効期限が切れました。画面を再読み込みしてください");
+
+  const ss = getSpreadsheet();
+  const ev = findEventRow_(eventName);
+  if (!ev) throw new Error("イベントが見つかりませんでした");
+
+  // ★主催者チェック（サーバー側で本人確認。URL直叩きでも通らない）
+  if (String(me.userId) !== String(ev.creatorId)) {
+    throw new Error("日程を決定できるのは主催者だけです🙏");
+  }
+
+  ss.getSheetByName('Events').getRange(ev.row, 9).setValue(decidedDate);
+
+  // 宛先＝回答者全員＋主催者（重複除去）
+  const res = getAnswersOf_(eventName, ev.dates.split(','));
+  const targets = {};
+  res.allAnswers.forEach(function(a) { if (a.userId) targets[a.userId] = true; });
+  if (ev.creatorId) targets[ev.creatorId] = true;
+  const targetIds = Object.keys(targets);
+
+  // ★所要時間があれば終了予定も出す
+  let msg = `🎉 【${eventName}】の日程が決定しました！\n\n📅 ${buildDecidedLine_(decidedDate, ev.durationMin)}\n`;
+  if (ev.description && ev.description !== "なし") msg += `📝 ${ev.description}\n`;
+  msg += `\nご参加をお願いします🙇‍♂️`;
+  if (reminderMinutes && reminderMinutes > 0) {
+    msg += `\n\n🔔 開始 ${reminderMinutes} 分前にリマインドをお送りします。`;
+  }
+
+  let sent = 0;
+  targetIds.forEach(function(uid) { if (sendText_(uid, false, msg)) sent++; });
+
+  // リマインダー登録（1人1行）
+  if (reminderMinutes && reminderMinutes > 0) {
+    const targetDateTime = parseDateString(decidedDate);
+    if (targetDateTime) {
+      const triggerTime = new Date(targetDateTime.getTime() - (reminderMinutes * 60 * 1000));
+      const durLabel = formatDuration_(ev.durationMin);
+      let reminderMsg = `🔔 まもなく【${eventName}】が始まります！\n\n📅 ${buildDecidedLine_(decidedDate, ev.durationMin)}`;
+      if (ev.description && ev.description !== "なし") reminderMsg += `\n📝 ${ev.description}`;
+      const sheet = ss.getSheetByName('Reminders');
+      targetIds.forEach(function(uid) {
+        sheet.appendRow([eventName, 'POLLING', uid, 'false', reminderMsg, triggerTime.getTime()]);
+      });
+    }
+  }
+
+  return { sent: sent, total: targetIds.length };
+}
+
+// ===== リマインダー =====
+
+function parseDateString(dateStr) {
+  // 例: "7/27(月) 15:00", "12/10(木)"
+  const now = new Date();
+  const currentYear = now.getFullYear();
+
+  const dateMatch = String(dateStr).match(/(\d{1,2})\/(\d{1,2})/);
+  if (!dateMatch) return null;
+
+  const month = parseInt(dateMatch[1], 10) - 1; // JSの月は0ベース
+  const day = parseInt(dateMatch[2], 10);
+
+  let targetDate = new Date(currentYear, month, day);
+  if (targetDate.getTime() < now.getTime() - (30 * 24 * 60 * 60 * 1000)) {
+    targetDate.setFullYear(currentYear + 1);
+  }
+
+  const timeMatch = String(dateStr).match(/(\d{1,2}):(\d{2})/);
+  if (timeMatch) {
+    targetDate.setHours(parseInt(timeMatch[1], 10));
+    targetDate.setMinutes(parseInt(timeMatch[2], 10));
+  } else {
+    targetDate.setHours(0, 0, 0, 0);
+  }
+  return targetDate;
+}
+
+function checkAndSendReminders() {
+  const sheet = getSpreadsheet().getSheetByName('Reminders');
+  if (!sheet) return;
+
+  const data = sheet.getDataRange().getValues();
+  if (data.length <= 1) return;
+
+  const now = new Date().getTime();
+  const rowsToDelete = [];
+
+  // 下から上へ（行削除時のインデックスずれ防止）
+  for (let i = data.length - 1; i >= 1; i--) {
+    const scheduledTime = parseInt(data[i][5], 10);
+    if (!scheduledTime || now < scheduledTime) continue;
+    const targetId = data[i][2];
+    const isChannel = (data[i][3] === "true" || data[i][3] === true);
+    const message = data[i][4];
+    if (targetId && message) sendText_(targetId, isChannel, message);
+    rowsToDelete.push(i + 1);
+  }
+
+  for (const rowNum of rowsToDelete) sheet.deleteRow(rowNum);
+}
+
+function setupReminderTrigger() {
+  const triggers = ScriptApp.getProjectTriggers();
+  for (let i = 0; i < triggers.length; i++) {
+    if (triggers[i].getHandlerFunction() === 'checkAndSendReminders') return;
+  }
+  ScriptApp.newTrigger('checkAndSendReminders').timeBased().everyMinutes(1).create();
+}
+
+// ===== Bot UI（カルーセル）=====
+
+// ★予想所要時間の選択
+function sendDurationCarousel(targetId, isChannel) {
+  const rows = [];
+  for (let i = 0; i < DURATION_OPTIONS.length; i += 3) {
+    rows.push({
+      type: "box", layout: "horizontal", margin: "sm",
+      contents: DURATION_OPTIONS.slice(i, i + 3).map(o => ({
+        type: "button",
+        style: (o.min === 0) ? "link" : "secondary",
+        action: { type: "message", label: o.label, text: o.label }
+      }))
+    });
+  }
+
+  sendWorksMessage(targetId, isChannel, {
+    type: "flex",
+    altText: "予想所要時間を選択してください",
+    contents: {
+      type: "bubble",
+      body: {
+        type: "box", layout: "vertical",
+        contents: [
+          { type: "text", text: "⏱ 予想所要時間を選んでください", weight: "bold", size: "sm", wrap: true },
+          { type: "text", text: "※細かく指定したい場合は 45 のように「分」の数字だけ送ってください💡", size: "xxs", color: "#888888", margin: "sm", wrap: true },
+          { type: "separator", margin: "md" },
+          ...rows
+        ]
+      }
+    }
+  });
+}
+
+function sendDateCarousel(targetId, isChannel) {
+  const bubbles = [];
+  const today = new Date();
+
+  for (let b = 0; b < 4; b++) {
+    const buttons = [];
+    for (let i = 0; i < 5; i++) {
+      const d = new Date(today.getTime());
+      d.setDate(d.getDate() + (b * 5) + i);
+      const w = ["日","月","火","水","木","金","土"][d.getDay()];
+      const labelStr = `${d.getMonth() + 1}/${d.getDate()}(${w})`;
+      buttons.push({
+        type: "button", style: "primary", margin: "sm",
+        action: { type: "message", label: labelStr, text: labelStr }
+      });
+    }
+    bubbles.push({
+      type: "bubble",
+      body: {
+        type: "box", layout: "vertical",
+        contents: [
+          { type: "text", text: b === 0 ? "📅 直近の候補日時" : "📅 先の候補日時", weight: "bold", size: "sm", color: "#333333" },
+          { type: "separator", margin: "md" },
+          ...buttons
+        ]
+      }
+    });
+  }
+
+  sendWorksMessage(targetId, isChannel, {
+    type: "flex",
+    altText: "候補日時を選択してください",
+    contents: { type: "carousel", contents: bubbles }
+  });
+}
+
+// ★「終日」は廃止（TIME_OPTIONS を使用）
+function sendTimeCarousel(targetId, isChannel, selectedDate) {
+  const timeRows = [];
+  for (let i = 0; i < TIME_OPTIONS.length; i += 3) {
+    timeRows.push({
+      type: "box", layout: "horizontal",
+      contents: TIME_OPTIONS.slice(i, i + 3).map(t => ({
+        type: "button", style: "secondary", margin: "sm",
+        action: { type: "message", label: t, text: t }
+      }))
+    });
+  }
+
+  sendWorksMessage(targetId, isChannel, {
+    type: "flex",
+    altText: "時間を選択してください",
+    contents: {
+      type: "bubble",
+      body: {
+        type: "box", layout: "vertical",
+        contents: [
+          { type: "text", text: `⏰ ${selectedDate} の時間を選択`, weight: "bold", size: "sm" },
+          { type: "text", text: "※細かい時間設定したい場合は 1020 とか数字4桁で教えてください💡", size: "xxs", color: "#888888", margin: "sm", wrap: true },
+          { type: "separator", margin: "md" },
+          ...timeRows
+        ]
+      }
+    }
+  });
+}
+
+function sendAddMoreMenu(targetId, isChannel, dates) {
+  sendWorksMessage(targetId, isChannel, {
+    type: "flex",
+    altText: "追加しますか？",
+    contents: {
+      type: "bubble",
+      body: {
+        type: "box", layout: "vertical",
+        contents: [
+          { type: "text", text: "📌 現在の候補日時", weight: "bold", size: "sm" },
+          { type: "text", text: dates.join("\n"), wrap: true, size: "sm", margin: "md" },
+          { type: "separator", margin: "md" },
+          { type: "button", style: "primary", margin: "md", action: { type: "message", label: "➕ さらに日時を追加する", text: "さらに追加" } },
+          { type: "button", style: "secondary", margin: "sm", action: { type: "message", label: "✅ 追加を完了して作成", text: "完了" } },
+          { type: "button", style: "link", margin: "sm", color: "#d9534f", action: { type: "message", label: "❌ キャンセル", text: "キャンセル" } }
+        ]
+      }
+    }
+  });
+}
+
+function addDateAndShowMenu(newDateStr, userId, targetId, isChannel) {
+  const cache = CacheService.getScriptCache();
+  const dates = JSON.parse(cache.get('event_dates_' + userId) || "[]");
+  if (!dates.includes(newDateStr)) dates.push(newDateStr);
+  cache.put('event_dates_' + userId, JSON.stringify(dates), 3600);
+  cache.put('state_' + userId, 'WAIT_EVENT_DATES', 3600);
+  sendAddMoreMenu(targetId, isChannel, dates);
+}
+
+// ===== Webhook =====
+
+const DRAFT_KEYS = ['event_name_', 'event_desc_', 'event_dur_', 'event_dates_', 'temp_date_'];
+
+function clearDraft_(cache, userId) {
+  DRAFT_KEYS.forEach(function(k) { cache.remove(k + userId); });
+  cache.remove('state_' + userId);
+}
+
+function doPost(e) {
+  try {
+    if (!e || !e.postData || !e.postData.contents) return ContentService.createTextOutput("200 OK");
+
+    const json = JSON.parse(e.postData.contents);
+    const userId = (json.source && (json.source.accountId || json.source.userId)) || "";
+    const channelId = json.source && json.source.channelId;
+    const targetId = channelId ? channelId : userId;
+    const isChannel = !!channelId;
+    if (!userId) return ContentService.createTextOutput("200 OK");
+
+    const cache = CacheService.getScriptCache();
+    const stateKey = 'state_' + userId;
+    const currentState = cache.get(stateKey);
+
+    initSheets();
+
+    if (json.type !== 'message') return ContentService.createTextOutput("200 OK");
+    const text = (json.content && json.content.text) ? json.content.text.trim() : "";
+    if (!text) return ContentService.createTextOutput("200 OK");
+
+    if (text === 'キャンセル') {
+      clearDraft_(cache, userId);
+      sendText_(targetId, isChannel, "❌ イベント作成をキャンセルしました。");
+      return ContentService.createTextOutput("200 OK");
+    }
+
+    // 【STEP 1】イベント名
+    if (currentState === 'WAIT_EVENT_NAME') {
+      if (isEventExists(text)) {
+        sendText_(targetId, isChannel, `⚠️ イベント名「${text}」は既に存在します！\n別の名前を入力してください🙏\n（やめる場合は「キャンセル」）`);
+        return ContentService.createTextOutput("200 OK");
+      }
+      cache.put('event_name_' + userId, text, 3600);
+      cache.put(stateKey, 'WAIT_EVENT_DESC', 3600);
+      sendText_(targetId, isChannel, `✅ イベント名を「${text}」に設定しました！\n\n次に【📝 説明】を入力してください。\n（特にない場合は「なし」）`);
+      return ContentService.createTextOutput("200 OK");
+    }
+
+    // 【STEP 2】説明 → ★所要時間へ
+    if (currentState === 'WAIT_EVENT_DESC') {
+      cache.put('event_desc_' + userId, text, 3600);
+      cache.put(stateKey, 'WAIT_EVENT_DURATION', 3600);
+      sendDurationCarousel(targetId, isChannel);
+      return ContentService.createTextOutput("200 OK");
+    }
+
+    // 【STEP 3】★予想所要時間
+    if (currentState === 'WAIT_EVENT_DURATION') {
+      const dur = parseDuration_(text);
+      if (dur === null) {
+        sendText_(targetId, isChannel, "⚠️ 所要時間が読み取れませんでした💦\nボタンから選ぶか、「45」「1時間30分」のように入力してください🙏");
+        return ContentService.createTextOutput("200 OK");
+      }
+      cache.put('event_dur_' + userId, String(dur), 3600);
+      cache.put('event_dates_' + userId, JSON.stringify([]), 3600);
+      cache.put(stateKey, 'WAIT_EVENT_DATES', 3600);
+
+      const label = formatDuration_(dur);
+      sendText_(targetId, isChannel, label
+        ? `⏱ 予想所要時間を「${label}」に設定しました！\n\n続いて候補日時を選んでください👇`
+        : `⏱ 予想所要時間は「指定なし」にしました。\n\n続いて候補日時を選んでください👇`);
+      sendDateCarousel(targetId, isChannel);
+      return ContentService.createTextOutput("200 OK");
+    }
+
+    // 【STEP 4】日付
+    if (currentState === 'WAIT_EVENT_DATES') {
+      if (text === 'さらに追加') {
+        sendDateCarousel(targetId, isChannel);
+        return ContentService.createTextOutput("200 OK");
+      }
+      if (text === '完了') {
+        const dates = JSON.parse(cache.get('event_dates_' + userId) || "[]");
+        if (dates.length === 0) {
+          sendText_(targetId, isChannel, "⚠️ 候補日時が1つもありません💦 最低1つは選択してください🙏");
+          return ContentService.createTextOutput("200 OK");
+        }
+        const eventName = cache.get('event_name_' + userId);
+        const eventDesc = cache.get('event_desc_' + userId);
+        const eventDur = parseInt(cache.get('event_dur_' + userId), 10) || 0;
+
+        createEvent(eventName, dates.join(','), userId, eventDesc, targetId, isChannel, eventDur);
+        clearDraft_(cache, userId);
+
+        if (!CONFIG.WEBAPP_URL) {
+          sendText_(targetId, isChannel, "🚨 WEBAPP_URLが未設定です。スクリプトプロパティを確認してください。");
+          return ContentService.createTextOutput("200 OK");
+        }
+        sendText_(targetId, isChannel, `✨ イベント「${eventName}」を作成しました！\n\n📤 次のメッセージをそのままトークに転送してください👇`);
+        sendText_(targetId, isChannel, buildShareMessage_(eventName, eventDesc, dates, eventDur));
+        return ContentService.createTextOutput("200 OK");
+      }
+
+      cache.put('temp_date_' + userId, text, 3600);
+      cache.put(stateKey, 'WAIT_EVENT_TIME', 3600);
+      sendTimeCarousel(targetId, isChannel, text);
+      return ContentService.createTextOutput("200 OK");
+    }
+
+    // 【STEP 5】時間
+    if (currentState === 'WAIT_EVENT_TIME') {
+      const tempDate = cache.get('temp_date_' + userId);
+      if (tempDate) {
+        let timeStr = text;
+        const normalized = text.replace(/[０-９]/g, s => String.fromCharCode(s.charCodeAt(0) - 0xFEE0));
+        if (/^\d{4}$/.test(normalized)) {
+          timeStr = normalized.substring(0, 2) + ":" + normalized.substring(2, 4);
+        }
+        addDateAndShowMenu(`${tempDate} ${timeStr}`, userId, targetId, isChannel);
+      }
+      return ContentService.createTextOutput("200 OK");
+    }
+
+    // ===== コマンド =====
+    const args = text.split(/[\s　]+/); // 全角・半角スペース両対応
+    const command = args[0];
+    const restName = args.slice(1).join(' ');
+
+    if (['いべんと', 'イベント', '作成', 'つくる'].includes(command) && args.length === 1) {
+      cache.put(stateKey, 'WAIT_EVENT_NAME', 3600);
+      sendText_(targetId, isChannel, "🎉 イベント作成を開始します！\nまずは【イベント名】を入力してください。\n（やめる場合は「キャンセル」）");
+      return ContentService.createTextOutput("200 OK");
+    }
+
+    if (['URL', 'url', '回答URL', '共有'].includes(command) && restName) {
+      const ev = findEventRow_(restName);
+      if (!ev) {
+        sendText_(targetId, isChannel, `😢 イベント「${restName}」が見つかりません。\n「一覧」で確認できます。`);
+        return ContentService.createTextOutput("200 OK");
+      }
+      if (!CONFIG.WEBAPP_URL) {
+        sendText_(targetId, isChannel, "🚨 WEBAPP_URLが未設定です。");
+        return ContentService.createTextOutput("200 OK");
+      }
+      sendText_(targetId, isChannel, "📤 下のメッセージをそのままトークに転送してください👇");
+      sendText_(targetId, isChannel, buildShareMessage_(ev.eventName, ev.description, ev.dates.split(','), ev.durationMin));
+      return ContentService.createTextOutput("200 OK");
+    }
+
+    if (['一覧', 'いちらん', 'list'].includes(command.toLowerCase())) {
+      const data = getSpreadsheet().getSheetByName('Events').getDataRange().getValues();
+      const mine = [];
+      for (let i = 1; i < data.length; i++) {
+        if (String(data[i][2]) === String(userId)) {
+          mine.push({ name: String(data[i][0]), decided: String(data[i][8] || "") });
+        }
+      }
+      if (mine.length === 0) {
+        sendText_(targetId, isChannel, "📭 作成したイベントはまだありません。\n「イベント」と送信して作成できます✨");
+        return ContentService.createTextOutput("200 OK");
+      }
+      let t = `📋 あなたが作成したイベント（${mine.length}件）\n\n`;
+      t += mine.map(function(m) { return m.decided ? `・${m.name}（決定：${m.decided}）` : `・${m.name}`; }).join('\n');
+      t += `\n\n「確認 イベント名」で集計、「URL イベント名」で転送用メッセージを再発行できます💡`;
+      sendText_(targetId, isChannel, t);
+      return ContentService.createTextOutput("200 OK");
+    }
+
+    if (command === '確認' && restName) {
+      sendText_(targetId, isChannel, getSummary(restName));
+      return ContentService.createTextOutput("200 OK");
+    }
+
+    if (command === '削除' && restName) {
+      const ev = findEventRow_(restName);
+      if (!ev) {
+        sendText_(targetId, isChannel, `😢 イベント「${restName}」が見つかりません。`);
+        return ContentService.createTextOutput("200 OK");
+      }
+      if (String(ev.creatorId) !== String(userId)) {
+        sendText_(targetId, isChannel, `⚠️ 「${restName}」を削除できるのは主催者だけです🙏`);
+        return ContentService.createTextOutput("200 OK");
+      }
+      deleteEvent_(restName);
+      sendText_(targetId, isChannel, `🗑️ イベント「${restName}」と回答をすべて削除しました。`);
+      return ContentService.createTextOutput("200 OK");
+    }
+
+    if (['へるぷ', 'ヘルプ', 'help'].includes(command.toLowerCase())) {
+      sendText_(targetId, isChannel, `🤖 【日程調整さんBot の使い方】
+
+◆ 📅 作る
+「イベント」と送信 → 名前 → 説明 → 予想所要時間 → 候補日時 の順に設定。
+作成すると、そのまま転送できるメッセージが届きます。
+
+◆ 📤 集める
+届いたメッセージをトークに転送するだけ。
+受け取った人はURLを開いて〇△×をタップするだけです。
+（LINE WORKSの確認が一度入りますが、名前の入力は不要です）
+
+◆ 📊 見る・決める
+「確認 イベント名」で集計をトークに表示。
+日程の決定ボタンは、主催者がURLを開いたときだけ表示されます。
+決定すると、回答者全員のBotトークに通知が届きます。
+
+◆ 🔁 その他
+・一覧 … 自分が作ったイベント一覧
+・URL イベント名 … 転送用メッセージを再発行
+・削除 イベント名 … イベントと回答を削除
+・キャンセル … 作成の中断`);
+      return ContentService.createTextOutput("200 OK");
+    }
+
+    sendText_(targetId, isChannel, `🤖 コマンドがわかりません💦\n「ヘルプ」と送信すると使い方が見られます💡`);
+    return ContentService.createTextOutput("200 OK");
+
+  } catch (error) {
+    console.error("doPost Error: " + error.message);
+    if (e && e.postData) {
+      try {
+        const json = JSON.parse(e.postData.contents);
+        const tId = (json.source && json.source.channelId) || (json.source && (json.source.accountId || json.source.userId));
+        const isCh = !!(json.source && json.source.channelId);
+        if (tId) sendText_(tId, isCh, `🚨 エラーが発生しました: ${error.message}`);
+      } catch (e2) {
+        console.error("error notify failed: " + e2.message);
+      }
+    }
+  }
+
+  return ContentService.createTextOutput("200 OK");
+}
