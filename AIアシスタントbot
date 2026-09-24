@@ -1,46 +1,44 @@
 /**
- * LINE WORKS AIアシスタントBot v2.4
+ * LINE WORKS AIアシスタントBot v3.0
  * Cloudflare Workers (ES Modules) / KV / OpenAI Chat Completions / LINE WORKS API 2.0
  *
- * v2 変更点
- * - アシスタント未選択の間は、何を送ってもキャラ選択FLEX(Flexible Template)を返す
- * - 7種: 整形外科医 / 内科医 / 看護師 / 薬剤師 / 管理栄養士 / 理学療法士 / エンジニア
- * - システムプロンプトは環境変数 PROMPT_* から読み込み（未設定時は最低限の既定文）
- * - 会話履歴は「ユーザー × アシスタント」単位でKV保存（直近 HISTORY_TURNS 往復、既定10）
- * - グループ(チャンネル)内では「チャンネル × ユーザー」単位で分離 → 記録が混ざらない
+ * ------------------------------------------------------------------
+ * v3.0 修正内容（「Botが反応しない」対策）
+ * ------------------------------------------------------------------
+ * 1. Webhookを「どのパスでも」受け付けるようにした
+ *    → Callback URLに /callback を付け忘れても動く（旧版は404で無言になった）
+ * 2. FLEXの type を "flexible" → "flex" に修正（LINE WORKS Bot API 2.0の正しい名称）
+ * 3. userId を source.accountId → source.userId の順で取得
+ *    → 実機で accountId が入ってくるケースに対応
+ * 4. 秘密鍵がPKCS#1（-----BEGIN RSA PRIVATE KEY-----）でも読めるようにした
+ *    → GASのcomputeRsaSha256Signatureは両対応だが、WebCryptoはPKCS#8のみのため
+ *      コード側でPKCS#8に変換してから読み込む
+ * 5. LINEWORKS_BOT_SECRET が未設定のときは署名検証をスキップ（起動優先）
+ *    → 設定済みなのに一致しない場合は理由をKVに記録する
+ * 6. エラーをKVに記録し、GET /diag で確認できるようにした
+ *    → ブラウザ運用で wrangler tail が使えないため
+ * 7. quickReply は既定オフ（環境変数 QUICK_REPLY=on で有効化）
  *
- * v2.1 変更点
- * - メニュー/めにゅー → 選択解除してキャラ選択FLEXへ（履歴は残す）
- * - リセット/りせっと → 今のアシスタントの履歴を削除してキャラ選択FLEXへ
- * - ヘルプ/へるぷ/help → 使い方＋「AIの回答は参考程度に」の注意書き
- * - クイックリプライに「ヘルプ」追加、FLEXフッターに注意書き追加
+ * ------------------------------------------------------------------
+ * 動作確認用エンドポイント
+ * ------------------------------------------------------------------
+ *   GET /        … 環境変数・KV・プロンプトの状態
+ *   GET /diag    … 秘密鍵の形式判定、アクセストークン取得テスト、直近のエラー
+ *   GET /diag?to=<LINE WORKSのuserId>  … そのユーザーにテスト送信
  *
- * v2.2 変更点
- * - 絵文字を見直し（看護師 🩹 / 理学療法士 🚶）
- *   ※合成絵文字(ZWJ)は古い端末で割れて表示されるため、1文字の絵文字のみ使用
- * - FLEXのボタンラベルにも絵文字を表示
- *
- * v2.3 変更点
- * - 既定の共通プロンプトを wrangler.toml の共通ルールと同じ内容に更新
- * - ヘルスチェック(GET /)で各 PROMPT_* のバイト数を表示し、5KB上限に近いものを警告
- *
- * v2.4 変更点
- * - 画面表示の呼称を「AI専門家」→「AIアシスタント」に統一
- *   （コマンドは「専門家」「アシスタント」どちらでも受け付ける＝後方互換）
- *
+ * ------------------------------------------------------------------
  * 【本番運用上の注意】
  * - 会話本文・ユーザーID・トークン・鍵はログに出さない（医療情報を含みうるため）
  * - KVの履歴はTTLで自動失効（HISTORY_TTL_DAYS、既定7日）
- * - 同一ユーザーが極めて短時間に連投すると、KVの結果整合性により
- *   1往復分の履歴が欠けることがある（実害は小さい。厳密にするならDurable Objects）
  * - Cloudflareの環境変数は1つ5KBまで（日本語で約1,600文字）
+ * - 動作確認が済んだら LINEWORKS_BOT_SECRET を必ず設定すること
  */
 
 // ==================================================================
 // 1. アシスタント レジストリ
 //    追加するときはこの配列に1要素足し、対応する PROMPT_* を環境変数に設定するだけ。
 //    並び順 = FLEXのボタン順 = 番号選択の順。
-//    emoji は1文字の絵文字を推奨（👩‍⚕️ のような合成絵文字は端末により割れる）
+//    emoji は1文字の絵文字を推奨（合成絵文字は端末により割れる）
 // ==================================================================
 
 const EXPERTS = [
@@ -148,7 +146,11 @@ const LW_TEXT_LIMIT = 1900;             // LINE WORKSテキスト上限(2000)に
 const OPENAI_TIMEOUT_MS = 55000;
 
 const ENV_VAR_LIMIT_BYTES = 5120;       // Cloudflare環境変数の上限（5KB）
-const ENV_VAR_WARN_BYTES = 4600;        // これを超えたら警告
+const ENV_VAR_WARN_BYTES = 4600;
+
+const ISSUE_KEY = "sys:last_issues";    // 直近のエラー記録（/diag で表示）
+const ISSUE_KEEP = 10;
+const ISSUE_TTL = 60 * 60 * 24 * 3;     // 3日
 
 // 「専門家」系のワードは旧バージョンからの後方互換で残す
 const CMD_MENU = [
@@ -225,16 +227,6 @@ function b64url(input) {
   return raw.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
-/** PEM -> ArrayBuffer（ダッシュボード貼り付けで改行が "\n" 文字列化しても対応） */
-function pemToArrayBuffer(pem) {
-  const body = String(pem)
-    .replace(/\\n/g, "\n")
-    .replace(/-----BEGIN [^-]+-----/g, "")
-    .replace(/-----END [^-]+-----/g, "")
-    .replace(/\s+/g, "");
-  return b64ToBytes(body).buffer;
-}
-
 function safeEqual(a, b) {
   if (typeof a !== "string" || typeof b !== "string") return false;
   if (a.length !== b.length) return false;
@@ -262,7 +254,6 @@ function envText(value) {
   return typeof value === "string" ? value.replace(/\\n/g, "\n").trim() : "";
 }
 
-/** UTF-8でのバイト数 */
 function byteLength(value) {
   return typeof value === "string" ? new TextEncoder().encode(value).length : 0;
 }
@@ -270,6 +261,24 @@ function byteLength(value) {
 /** 秘密情報・本文を含まない安全なログ */
 function logSafe(event, detail) {
   console.log(JSON.stringify({ event, detail: detail ?? null }));
+}
+
+/**
+ * エラーをKVに記録（ブラウザ運用で wrangler tail が使えないため）
+ * 会話本文・ユーザーID・鍵・トークンは記録しない。
+ */
+async function recordIssue(env, code, detail) {
+  logSafe(code, detail);
+  if (!env.BOT_KV) return;
+  try {
+    const prev = (await env.BOT_KV.get(ISSUE_KEY, "json")) || [];
+    prev.unshift({ at: new Date().toISOString(), code, detail: detail ?? null });
+    await env.BOT_KV.put(ISSUE_KEY, JSON.stringify(prev.slice(0, ISSUE_KEEP)), {
+      expirationTtl: ISSUE_TTL,
+    });
+  } catch (_) {
+    /* 記録できなくても本処理は続ける */
+  }
 }
 
 /** LINE WORKSの文字数上限に合わせて改行位置優先で分割 */
@@ -287,7 +296,100 @@ function splitText(text, limit) {
 }
 
 // ==================================================================
-// 4. LINE WORKS 認証（JWT → アクセストークン）
+// 4. 秘密鍵の読み込み（PKCS#8 / PKCS#1 両対応）
+//    GASのcomputeRsaSha256Signatureは両方読めるが、
+//    WebCryptoのimportKeyはPKCS#8しか受け付けないため変換する。
+// ==================================================================
+
+/** DERの長さフィールドを作る */
+function derLength(len) {
+  if (len < 0x80) return [len];
+  const bytes = [];
+  let x = len;
+  while (x > 0) {
+    bytes.unshift(x & 0xff);
+    x >>= 8;
+  }
+  return [0x80 | bytes.length, ...bytes];
+}
+
+/**
+ * PKCS#1のRSA秘密鍵を、PKCS#8の入れ物で包む。
+ * PKCS#8 = SEQUENCE { INTEGER 0, SEQUENCE { OID rsaEncryption, NULL }, OCTET STRING { PKCS#1 } }
+ */
+function wrapPkcs1AsPkcs8(pkcs1) {
+  const version = [0x02, 0x01, 0x00];
+  const algId = [
+    0x30, 0x0d,
+    0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01,
+    0x05, 0x00,
+  ];
+  const octetHeader = [0x04, ...derLength(pkcs1.length)];
+  const bodyLen = version.length + algId.length + octetHeader.length + pkcs1.length;
+  const seqHeader = [0x30, ...derLength(bodyLen)];
+
+  const out = new Uint8Array(seqHeader.length + bodyLen);
+  let p = 0;
+  const put = (arr) => { out.set(arr, p); p += arr.length; };
+  put(seqHeader);
+  put(version);
+  put(algId);
+  put(octetHeader);
+  put(pkcs1);
+  return out.buffer;
+}
+
+/** PEM文字列から鍵の形式を判定する（診断用） */
+function detectKeyFormat(pem) {
+  const s = String(pem || "").replace(/\\n/g, "\n");
+  if (!s.trim()) return "empty";
+  if (s.includes("BEGIN RSA PRIVATE KEY")) return "pkcs1";
+  if (s.includes("BEGIN PRIVATE KEY")) return "pkcs8";
+  if (s.includes("BEGIN ENCRYPTED PRIVATE KEY")) return "encrypted";
+  return "headerless";
+}
+
+/** PEM本体（BASE64部分）だけを取り出してバイト列にする */
+function pemBody(pem) {
+  const body = String(pem)
+    .replace(/\\n/g, "\n")
+    .replace(/-----BEGIN [^-]+-----/g, "")
+    .replace(/-----END [^-]+-----/g, "")
+    .replace(/\s+/g, "");
+  if (!body) throw new Error("秘密鍵が空です");
+  return b64ToBytes(body);
+}
+
+/** 署名用の鍵をインポート。形式を自動判別し、PKCS#1はPKCS#8に変換する。 */
+async function importSigningKey(pem) {
+  const format = detectKeyFormat(pem);
+  if (format === "empty") throw new Error("LINEWORKS_PRIVATE_KEY が未設定です");
+  if (format === "encrypted") {
+    throw new Error("パスフレーズ付きの秘密鍵は使えません。復号した鍵を登録してください");
+  }
+
+  const raw = pemBody(pem);
+  const algo = { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" };
+
+  // PKCS#1と分かっているものは変換してから読む
+  if (format === "pkcs1") {
+    return crypto.subtle.importKey("pkcs8", wrapPkcs1AsPkcs8(raw), algo, false, ["sign"]);
+  }
+
+  // PKCS#8として読む。失敗したらPKCS#1とみなして変換し、もう一度試す。
+  try {
+    return await crypto.subtle.importKey("pkcs8", raw.buffer, algo, false, ["sign"]);
+  } catch (e) {
+    try {
+      return await crypto.subtle.importKey("pkcs8", wrapPkcs1AsPkcs8(raw), algo, false, ["sign"]);
+    } catch (_) {
+      throw new Error("秘密鍵を読み込めませんでした（形式: " + format + "）");
+    }
+  }
+}
+
+// ==================================================================
+// 5. LINE WORKS 認証（JWT → アクセストークン）
 // ==================================================================
 
 function tokenCacheKey(env) {
@@ -298,26 +400,56 @@ async function createJWT(env) {
   const now = Math.floor(Date.now() / 1000);
   const header = { alg: "RS256", typ: "JWT" };
   const claims = {
-    iss: env.LINEWORKS_CLIENT_ID,
-    sub: env.LINEWORKS_SERVICE_ACCOUNT,
+    iss: String(env.LINEWORKS_CLIENT_ID || "").trim(),
+    sub: String(env.LINEWORKS_SERVICE_ACCOUNT || "").trim(),
     iat: now,
     exp: now + 3600,
   };
   const signingInput = `${b64url(JSON.stringify(header))}.${b64url(JSON.stringify(claims))}`;
 
-  const key = await crypto.subtle.importKey(
-    "pkcs8",
-    pemToArrayBuffer(env.LINEWORKS_PRIVATE_KEY),
-    { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
-    false,
-    ["sign"]
-  );
+  const key = await importSigningKey(env.LINEWORKS_PRIVATE_KEY);
   const sig = await crypto.subtle.sign(
     "RSASSA-PKCS1-v1_5",
     key,
     new TextEncoder().encode(signingInput)
   );
   return `${signingInput}.${b64url(sig)}`;
+}
+
+/**
+ * アクセストークン取得。
+ * verbose=true のときは失敗理由を含む結果オブジェクトを返す（/diag 用）。
+ */
+async function fetchAccessToken(env) {
+  const body = new URLSearchParams({
+    assertion: await createJWT(env),
+    grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
+    client_id: String(env.LINEWORKS_CLIENT_ID || "").trim(),
+    client_secret: String(env.LINEWORKS_CLIENT_SECRET || "").trim(),
+    scope: "bot",
+  });
+
+  const res = await fetch(LW_AUTH_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: body.toString(),
+  });
+
+  const text = await res.text();
+  if (!res.ok) {
+    // レスポンス本文にトークンは含まれない。原因表示のため先頭のみ使う。
+    const reason = text.slice(0, 200);
+    throw new Error(`token ${res.status}: ${reason}`);
+  }
+
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch (_) {
+    throw new Error("トークン応答がJSONではありません");
+  }
+  if (!data.access_token) throw new Error("access_token が含まれていません");
+  return { token: data.access_token, expiresIn: Number(data.expires_in) || 86400 };
 }
 
 async function getAccessToken(env) {
@@ -329,48 +461,37 @@ async function getAccessToken(env) {
     /* 読み失敗は無視して再取得 */
   }
 
-  const body = new URLSearchParams({
-    assertion: await createJWT(env),
-    grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
-    client_id: env.LINEWORKS_CLIENT_ID,
-    client_secret: env.LINEWORKS_CLIENT_SECRET,
-    scope: "bot",
-  });
-
-  const res = await fetch(LW_AUTH_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: body.toString(),
-  });
-  if (!res.ok) {
-    logSafe("lw_token_failed", { status: res.status });
-    throw new Error(`LINEWORKS token error: ${res.status}`);
-  }
-
-  const data = await res.json();
-  const expiresIn = Number(data.expires_in) || 86400;
+  const { token, expiresIn } = await fetchAccessToken(env);
   try {
     await env.BOT_KV.put(
       cacheKey,
-      JSON.stringify({ token: data.access_token, exp: Math.floor(Date.now() / 1000) + expiresIn }),
+      JSON.stringify({ token, exp: Math.floor(Date.now() / 1000) + expiresIn }),
       { expirationTtl: Math.max(60, expiresIn - 60) }
     );
   } catch (_) {
     /* 書き失敗は無視 */
   }
-  return data.access_token;
+  return token;
 }
 
 // ==================================================================
-// 5. LINE WORKS 送信
+// 6. LINE WORKS 送信
 //    target = { userId, channelId }  channelIdがあればトークルームへ送信
 // ==================================================================
 
-// quickReply非対応環境で400が返った場合、以後このisolateでは付けない
-let quickReplyEnabled = true;
+// quickReply非対応で400が返った場合、以後このisolateでは付けない
+let quickReplyEnabled = null; // null = 未判定（環境変数で初期化）
+
+function quickReplyAllowed(env) {
+  if (quickReplyEnabled === null) {
+    quickReplyEnabled = String(env.QUICK_REPLY || "").toLowerCase() === "on";
+  }
+  return quickReplyEnabled;
+}
 
 function messageUrl(env, target) {
-  const base = `${LW_API_BASE}/bots/${encodeURIComponent(env.LINEWORKS_BOT_ID)}`;
+  const botId = encodeURIComponent(String(env.LINEWORKS_BOT_ID || "").trim());
+  const base = `${LW_API_BASE}/bots/${botId}`;
   return target.channelId
     ? `${base}/channels/${encodeURIComponent(target.channelId)}/messages`
     : `${base}/users/${encodeURIComponent(target.userId)}/messages`;
@@ -386,14 +507,21 @@ async function postMessage(env, target, content) {
 
   try {
     let res = await doPost(await getAccessToken(env));
+
+    // 401ならトークンを捨てて1度だけ再取得
     if (res.status === 401) {
       await env.BOT_KV.delete(tokenCacheKey(env)).catch(() => {});
       res = await doPost(await getAccessToken(env));
     }
-    if (!res.ok) logSafe("lw_send_failed", { status: res.status, type: content.type });
+
+    if (!res.ok) {
+      // 本文にユーザーの質問は含まれないが、念のため先頭のみ記録
+      const body = (await res.text()).slice(0, 200);
+      await recordIssue(env, "lw_send_failed", { status: res.status, type: content.type, body });
+    }
     return { ok: res.ok, status: res.status };
   } catch (e) {
-    logSafe("lw_send_exception", { name: e && e.name });
+    await recordIssue(env, "lw_send_exception", { message: String(e && e.message).slice(0, 200) });
     return { ok: false, status: 0 };
   }
 }
@@ -416,12 +544,12 @@ async function sendText(env, target, text, { quick = false } = {}) {
   for (let i = 0; i < chunks.length; i++) {
     const isLast = i === chunks.length - 1;
     const content = { type: "text", text: chunks[i] };
-    const withQuick = quick && isLast && quickReplyEnabled;
+    const withQuick = quick && isLast && quickReplyAllowed(env);
     if (withQuick) content.quickReply = quickReply();
 
     let r = await postMessage(env, target, content);
     if (!r.ok && r.status === 400 && withQuick) {
-      quickReplyEnabled = false;
+      quickReplyEnabled = false; // 以後このisolateでは付けない
       delete content.quickReply;
       r = await postMessage(env, target, content);
     }
@@ -431,7 +559,8 @@ async function sendText(env, target, text, { quick = false } = {}) {
 }
 
 // ==================================================================
-// 6. キャラ選択FLEX（Flexible Template）
+// 7. キャラ選択FLEX
+//    ★ type は "flex"（"flexible" ではない）
 // ==================================================================
 
 function buildSelectorFlex(currentId) {
@@ -440,7 +569,7 @@ function buildSelectorFlex(currentId) {
     const btn = {
       type: "button",
       style: isCurrent ? "secondary" : "primary",
-      height: "sm",
+      margin: "sm",
       action: {
         type: "message",
         // 表示は絵文字付き、送信テキストは名前のみ（判定用）
@@ -454,45 +583,38 @@ function buildSelectorFlex(currentId) {
   });
 
   return {
-    type: "flexible",
+    type: "flex",
     altText: "AIアシスタントを選んでください",
     contents: {
       type: "bubble",
-      header: {
+      body: {
         type: "box",
         layout: "vertical",
         contents: [
           {
             type: "text",
-            text: "AIアシスタントを選んでください",
+            text: "🤖 AIアシスタントを選んでください",
             weight: "bold",
-            size: "lg",
+            size: "sm",
             wrap: true,
           },
           {
             type: "text",
             text: "タップすると、そのアシスタントと会話できます",
-            size: "xs",
+            size: "xxs",
             color: "#888888",
+            margin: "sm",
             wrap: true,
           },
-        ],
-      },
-      body: {
-        type: "box",
-        layout: "vertical",
-        spacing: "sm",
-        contents: buttons,
-      },
-      footer: {
-        type: "box",
-        layout: "vertical",
-        contents: [
+          { type: "separator", margin: "md" },
+          ...buttons,
+          { type: "separator", margin: "md" },
           {
             type: "text",
-            text: "※AIの回答は参考情報です。判断は必ず医師・薬剤師等にご確認ください。緊急時はすぐに医療機関へ。「ヘルプ」で使い方を表示します。",
+            text: "※AIの回答は参考情報です。判断は必ず医師等専門家にご確認ください。「へるぷ・ヘルプ」で使い方が出ます。",
             size: "xxs",
             color: "#999999",
+            margin: "md",
             wrap: true,
           },
         ],
@@ -516,7 +638,6 @@ async function sendSelector(env, target, currentId) {
   const r = await postMessage(env, target, buildSelectorFlex(currentId));
   if (!r.ok) {
     // FLEXが通らない場合もユーザーを無言にしない
-    logSafe("flex_fallback", { status: r.status });
     await sendText(env, target, buildTextMenu());
   }
 }
@@ -541,24 +662,32 @@ function buildHelp(env) {
 }
 
 // ==================================================================
-// 7. Webhook検証
+// 8. Webhook検証
 // ==================================================================
 
+/**
+ * 署名検証。
+ * BOT_SECRETが未設定なら検証をスキップする（起動を優先。GAS版も検証なしで動いている）
+ * 戻り値: "ok" | "skipped" | "ng"
+ */
 async function verifySignature(env, rawBody, signature) {
-  if (!signature) return false;
+  const secret = String(env.LINEWORKS_BOT_SECRET || "").trim();
+  if (!secret) return "skipped";
+  if (!signature) return "ng";
+
   try {
     const key = await crypto.subtle.importKey(
       "raw",
-      new TextEncoder().encode(env.LINEWORKS_BOT_SECRET),
+      new TextEncoder().encode(secret),
       { name: "HMAC", hash: "SHA-256" },
       false,
       ["sign"]
     );
     const mac = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(rawBody));
-    return safeEqual(bytesToB64(mac), signature);
+    return safeEqual(bytesToB64(mac), signature) ? "ok" : "ng";
   } catch (e) {
     logSafe("sig_verify_exception", { name: e && e.name });
-    return false;
+    return "ng";
   }
 }
 
@@ -571,7 +700,7 @@ function isFreshEvent(body) {
 }
 
 // ==================================================================
-// 8. KV（状態・履歴）
+// 9. KV（状態・履歴）
 //    キー設計（Bot ID + スコープで分離。ユーザー間で混ざらない）
 //      state:{botId}:{scope}            → { expert }
 //      hist:{botId}:{scope}:{expertId}  → [{role, content}, ...]
@@ -617,7 +746,7 @@ async function saveState(env, scope, state) {
       expirationTtl: STATE_TTL,
     });
   } catch (e) {
-    logSafe("kv_state_put_failed", { name: e && e.name });
+    await recordIssue(env, "kv_state_put_failed", { name: e && e.name });
   }
 }
 
@@ -644,7 +773,7 @@ async function saveHistory(env, scope, expertId, messages) {
       expirationTtl: historyTtl(env),
     });
   } catch (e) {
-    logSafe("kv_hist_put_failed", { name: e && e.name });
+    await recordIssue(env, "kv_hist_put_failed", { name: e && e.name });
   }
 }
 
@@ -669,7 +798,7 @@ function trimHistory(messages, turns) {
 }
 
 // ==================================================================
-// 9. プロンプト組み立て / OpenAI
+// 10. プロンプト組み立て / OpenAI
 // ==================================================================
 
 function buildSystemPrompt(env, expert) {
@@ -715,12 +844,13 @@ async function askOpenAI(env, expert, history, userText) {
       signal: AbortSignal.timeout(OPENAI_TIMEOUT_MS),
     });
   } catch (e) {
-    logSafe("openai_fetch_failed", { name: e && e.name }); // TimeoutError含む
+    await recordIssue(env, "openai_fetch_failed", { name: e && e.name });
     return null;
   }
 
   if (!res.ok) {
-    logSafe("openai_http_error", { status: res.status }); // 401/429/5xx
+    const body = (await res.text()).slice(0, 200); // APIキーは含まれない
+    await recordIssue(env, "openai_http_error", { status: res.status, body });
     return null;
   }
 
@@ -728,20 +858,22 @@ async function askOpenAI(env, expert, history, userText) {
   try {
     data = await res.json();
   } catch (e) {
-    logSafe("openai_json_error", { name: e && e.name });
+    await recordIssue(env, "openai_json_error", { name: e && e.name });
     return null;
   }
 
   const text = data?.choices?.[0]?.message?.content;
   if (typeof text !== "string" || !text.trim()) {
-    logSafe("openai_empty_response", { finish: data?.choices?.[0]?.finish_reason ?? null });
+    await recordIssue(env, "openai_empty_response", {
+      finish: data?.choices?.[0]?.finish_reason ?? null,
+    });
     return null;
   }
   return text.trim();
 }
 
 // ==================================================================
-// 10. アシスタント判定
+// 11. アシスタント判定
 // ==================================================================
 
 function matchExpertByText(norm) {
@@ -766,7 +898,7 @@ function isCommand(list, norm) {
 }
 
 // ==================================================================
-// 11. イベント処理
+// 12. イベント処理
 // ==================================================================
 
 async function selectExpert(env, target, scope, state, expert) {
@@ -794,15 +926,22 @@ async function backToSelector(env, target, scope, state) {
 async function handleEvent(env, body) {
   const src = body.source || {};
 
+  // ★ accountId を優先（動作実績のあるGAS版と同じ順序）
+  const userId = String(src.accountId || src.userId || "");
+  const channelId = src.channelId ? String(src.channelId) : null;
+
   // Botがトークルームに招待された
-  if ((body.type === "join" || body.type === "joined") && src.channelId) {
-    await sendSelector(env, { userId: null, channelId: src.channelId }, null);
+  if ((body.type === "join" || body.type === "joined") && channelId) {
+    await sendSelector(env, { userId: null, channelId }, null);
     return;
   }
 
-  if (!src.userId) return;
+  if (!userId) {
+    await recordIssue(env, "no_user_id", { type: body.type || null });
+    return;
+  }
 
-  const target = { userId: src.userId, channelId: src.channelId || null };
+  const target = { userId, channelId };
   const scope = scopeOf(target);
   const state = await loadState(env, scope);
 
@@ -902,13 +1041,12 @@ async function handleEvent(env, body) {
 }
 
 // ==================================================================
-// 12. ヘルスチェック
+// 13. ヘルスチェック / 診断
 // ==================================================================
 
 const REQUIRED_ENV = [
   "OPENAI_API_KEY",
   "LINEWORKS_BOT_ID",
-  "LINEWORKS_BOT_SECRET",
   "LINEWORKS_CLIENT_ID",
   "LINEWORKS_CLIENT_SECRET",
   "LINEWORKS_SERVICE_ACCOUNT",
@@ -919,7 +1057,6 @@ function buildHealth(env) {
   const missingEnv = REQUIRED_ENV.filter((k) => !env[k]);
   const kvBound = !!env.BOT_KV;
 
-  // プロンプト変数（共通＋個別）のサイズ確認
   const promptNames = [
     "PROMPT_COMMON",
     "PROMPT_COMMON_MEDICAL",
@@ -940,64 +1077,148 @@ function buildHealth(env) {
     status: missingEnv.length === 0 && kvBound ? "ok" : "misconfigured",
     missingEnv,
     kvBound,
-    missingPrompts,   // 未設定でも既定文で動く（警告扱い）
+    signatureCheck: env.LINEWORKS_BOT_SECRET ? "有効" : "スキップ中（BOT_SECRET未設定）",
+    missingPrompts,
     promptWarnings,
     promptSizes,
     model: env.OPENAI_MODEL || DEFAULT_MODEL,
     historyTurns: historyTurns(env),
     assistants: EXPERTS.map((e) => label(e)),
+    hint: "詳しい診断は /diag を開いてください",
   };
 }
 
+/** 秘密鍵・トークン・送信を実際に試す診断 */
+async function buildDiag(env, testUserId) {
+  const result = {
+    checkedAt: new Date().toISOString(),
+    privateKey: {},
+    accessToken: {},
+    testSend: null,
+    lastIssues: [],
+    note: "秘密情報は一切表示しません",
+  };
+
+  // --- 秘密鍵 ---
+  const format = detectKeyFormat(env.LINEWORKS_PRIVATE_KEY);
+  result.privateKey.format = format;
+  result.privateKey.formatLabel = {
+    pkcs8: "PKCS#8（そのまま使えます）",
+    pkcs1: "PKCS#1（自動でPKCS#8に変換します）",
+    headerless: "BEGIN/END行なし（BASE64として読み込みます）",
+    encrypted: "パスフレーズ付き（使えません。復号してください）",
+    empty: "未設定",
+  }[format] || format;
+
+  try {
+    await importSigningKey(env.LINEWORKS_PRIVATE_KEY);
+    result.privateKey.import = "ok";
+  } catch (e) {
+    result.privateKey.import = "ng";
+    result.privateKey.error = String(e && e.message).slice(0, 200);
+  }
+
+  // --- アクセストークン ---
+  if (result.privateKey.import === "ok") {
+    try {
+      const { expiresIn } = await fetchAccessToken(env);
+      result.accessToken.status = "ok";
+      result.accessToken.expiresIn = expiresIn;
+    } catch (e) {
+      result.accessToken.status = "ng";
+      result.accessToken.error = String(e && e.message).slice(0, 300);
+    }
+  } else {
+    result.accessToken.status = "skipped";
+  }
+
+  // --- テスト送信 ---
+  if (testUserId && result.accessToken.status === "ok") {
+    const r = await postMessage(
+      env,
+      { userId: testUserId, channelId: null },
+      { type: "text", text: "✅ Cloudflare Workers からのテスト送信です。" }
+    );
+    result.testSend = { ok: r.ok, status: r.status };
+  }
+
+  // --- 直近のエラー ---
+  if (env.BOT_KV) {
+    try {
+      result.lastIssues = (await env.BOT_KV.get(ISSUE_KEY, "json")) || [];
+    } catch (_) {
+      result.lastIssues = [];
+    }
+  }
+
+  return result;
+}
+
 // ==================================================================
-// 13. エントリポイント
+// 14. エントリポイント
+//     ★ POSTはどのパスでも受け付ける（Callback URLの /callback 有無を問わない）
 // ==================================================================
+
+function json(obj, status = 200) {
+  return new Response(JSON.stringify(obj, null, 2), {
+    status,
+    headers: { "Content-Type": "application/json; charset=utf-8" },
+  });
+}
 
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
-    // ヘルスチェック（値そのものは返さない）
-    if (request.method === "GET" && url.pathname === "/") {
-      return new Response(JSON.stringify(buildHealth(env), null, 2), {
-        headers: { "Content-Type": "application/json; charset=utf-8" },
-      });
+    // ---------- 診断系（GET） ----------
+    if (request.method === "GET") {
+      if (url.pathname === "/diag") {
+        const to = url.searchParams.get("to") || "";
+        return json(await buildDiag(env, to));
+      }
+      return json(buildHealth(env));
     }
 
-    if (request.method !== "POST" || url.pathname !== "/callback") {
-      return new Response("Not Found", { status: 404 });
+    if (request.method !== "POST") {
+      return new Response("Method Not Allowed", { status: 405 });
     }
 
+    // ---------- Webhook（POST／パスは問わない） ----------
     const rawBody = await request.text();
 
-    const valid = await verifySignature(env, rawBody, request.headers.get("X-WORKS-Signature"));
-    if (!valid) {
-      logSafe("invalid_signature", null);
+    const sig = await verifySignature(env, rawBody, request.headers.get("X-WORKS-Signature"));
+    if (sig === "ng") {
+      // 署名が合わない＝BOT_SECRETの取り違えが多い（Client Secretと混同しやすい）
+      await recordIssue(env, "invalid_signature", {
+        hasHeader: !!request.headers.get("X-WORKS-Signature"),
+        hint: "Bot SecretとClient Secretを取り違えていないか確認",
+      });
       return new Response("Unauthorized", { status: 401 });
     }
-
-    // 別Botからの誤配送を防ぐ
-    const botIdHeader = request.headers.get("X-WORKS-BotId");
-    if (botIdHeader && String(botIdHeader) !== String(env.LINEWORKS_BOT_ID)) {
-      logSafe("bot_id_mismatch", null);
-      return new Response("Forbidden", { status: 403 });
+    if (sig === "skipped") {
+      logSafe("signature_check_skipped", null);
     }
 
     let body;
     try {
       body = JSON.parse(rawBody);
     } catch (_) {
+      await recordIssue(env, "bad_json", null);
       return new Response("Bad Request", { status: 400 });
     }
 
     if (!isFreshEvent(body)) {
-      logSafe("stale_event_rejected", null);
+      await recordIssue(env, "stale_event_rejected", { issuedTime: body.issuedTime || null });
       return new Response("OK", { status: 200 });
     }
 
     // 先に200を返し、OpenAI呼び出しは裏で実行（Webhookの再送防止）
     ctx.waitUntil(
-      handleEvent(env, body).catch((e) => logSafe("handler_exception", { name: e && e.name }))
+      handleEvent(env, body).catch((e) =>
+        recordIssue(env, "handler_exception", {
+          message: String(e && e.message).slice(0, 300),
+        })
+      )
     );
     return new Response("OK", { status: 200 });
   },
