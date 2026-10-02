@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>感染症例ヘルパー</title>
+<link rel="icon" href="icons/icon32.png">
+<style>
+:root{
+  --ink:#1d2733; --sub:#5b6875; --line:#c3ccd6; --soft:#eef2f6; --accent:#2b5f86;
+  --ok:#1f6b35; --okbg:#dff0e3; --need:#8a6200; --needbg:#fff3c9; --ng:#b4410f; --ngbg:#fde8df;
+}
+*{ box-sizing:border-box; }
+body{
+  margin:0; font-family:"BIZ UDPGothic","Yu Gothic UI","Meiryo",sans-serif;
+  color:var(--ink); font-size:13px; line-height:1.5; background:#f6f8fa;
+}
+header{ display:flex; align-items:center; gap:6px; padding:10px 12px; background:#fff; border-bottom:1px solid var(--line); }
+header h1{ margin:0; font-size:15px; }
+header .v{ margin-left:auto; color:var(--sub); font-size:11px; }
+section{ margin:10px; padding:10px 12px; background:#fff; border:1px solid var(--line); border-radius:8px; }
+h2{ margin:0 0 6px; font-size:12px; color:var(--sub); font-weight:600; }
+dl{ display:grid; grid-template-columns:auto 1fr; gap:2px 10px; margin:0; }
+dt{ color:var(--sub); }
+dd{ margin:0; font-weight:600; }
+.code1{ margin-top:8px; padding:6px 8px; background:var(--soft); border-radius:6px; }
+.code1 b{ font-size:18px; letter-spacing:.04em; }
+.muted{ color:var(--sub); }
+
+#scanBox{ border:2px solid var(--line); border-radius:8px; padding:10px; text-align:center; cursor:text; transition:border-color .15s; }
+#scanBox.ready{ border-color:var(--ok); background:var(--okbg); }
+#scanBox .st{ font-weight:700; }
+#scan{ position:absolute; left:-9999px; width:1px; height:1px; }
+#echo{ margin-top:6px; font-family:Consolas,monospace; font-size:10px; color:var(--sub); word-break:break-all; }
+.btns{ display:flex; gap:6px; flex-wrap:wrap; margin-top:8px; }
+button{ font:inherit; border:1px solid var(--line); background:#fff; border-radius:6px; padding:5px 10px; cursor:pointer; }
+button:hover{ background:var(--soft); }
+button:disabled{ opacity:.45; cursor:default; }
+
+.msg{ padding:8px 10px; border-radius:6px; margin-bottom:6px; }
+.msg.ok{ background:var(--okbg); color:var(--ok); }
+.msg.ng{ background:var(--ngbg); color:var(--ng); }
+.msg.need{ background:var(--needbg); color:var(--need); }
+ul{ margin:4px 0 0; padding-left:18px; }
+li{ margin:1px 0; }
+.small{ font-size:11px; }
+</style>
+</head>
+<body>
+<header>
+  <img src="icons/icon32.png" width="20" height="20" alt="">
+  <h1>感染症例ヘルパー</h1>
+  <span class="v">v0.1.0 テスト版</span>
+</header>
+
+<section>
+  <h2>開いているページ</h2>
+  <div id="page" class="muted">確認中…</div>
+</section>
+
+<section>
+  <h2>QRを読み取る</h2>
+  <div id="scanBox" tabindex="-1">
+    <div class="st" id="scanState">ここをクリックしてから読み取ってください</div>
+    <div class="small muted">読み取ると、開いているシートにそのまま入力します</div>
+    <input type="password" id="scan" autocomplete="off" aria-label="QRの読み取り欄">
+    <div id="echo"></div>
+  </div>
+  <div class="btns">
+    <button id="btnFixed">固定値だけ入力</button>
+    <button id="btnClear">色付けを消す</button>
+    <button id="btnReload">ページ情報を更新</button>
+  </div>
+</section>
+
+<section id="resultSec" hidden>
+  <h2>結果</h2>
+  <div id="result"></div>
+</section>
+
+<script src="sidepanel.js"></script>
+</body>
+</html>
