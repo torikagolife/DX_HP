@@ -49,7 +49,7 @@ li{ margin:1px 0; }
 <header>
   <img src="icons/icon32.png" width="20" height="20" alt="">
   <h1>感染症例ヘルパー</h1>
-  <span class="v">v0.1.0 テスト版</span>
+  <span class="v">v0.3.0 テスト版</span>
 </header>
 
 <section>
