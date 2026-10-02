@@ -6,7 +6,7 @@
 <title>感染症例QR</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A//www.w3.org/2000/svg%22%20viewBox%3D%220%200%20100%20100%22%3E%3Ctext%20y%3D%22.9em%22%20font-size%3D%2290%22%3E%F0%9F%91%A8%E2%80%8D%E2%9D%A4%EF%B8%8F%E2%80%8D%F0%9F%91%A8%3C/text%3E%3C/svg%3E">
 <!--
-  感染症例QR  v0.1.0（テスト版：J-DOS study 人工関節のみ）
+  感染症例QR  v0.3.0（テスト版：J-DOS study 人工関節／脊椎、NOCOTA-II）
   ・電子カルテPC（閉鎖網）用の単一HTML。外部通信・CDN参照は一切なし
   ・手術予定CSV（CP932/62列）を読み込み、登録用の入力用紙をQR付きで印刷する
   ・QRの中身は英数字と / - . だけ（QRリーダーのキーボード配列に左右されないため）
@@ -90,7 +90,6 @@ table.pick tr:hover{ background:#f6f9fb; }
 .ptop .ids{ text-align:right; font-size:9.5pt; }
 .ptop .ids b{ font-size:12pt; }
 .code1{ margin-top:1.5mm; font-size:10pt; }
-.code1 span{ display:inline-block; min-width:30mm; border-bottom:1px solid var(--ink); }
 .screen-only .rm{ float:right; }
 .warns{ margin:2.5mm 0 0; padding:2mm 3mm; border:1px solid var(--warn); color:var(--warn); border-radius:2mm; font-size:9pt; }
 .warns div::before{ content:"⚠ "; }
@@ -150,6 +149,13 @@ input.dt{ width:34mm; }
   input.dt::-webkit-calendar-picker-indicator{ display:none; }
   *{ -webkit-print-color-adjust:exact; print-color-adjust:exact; }
 }
+.drop{ cursor:pointer; }
+.drop:hover{ border-color:var(--accent); color:var(--ink); }
+.setting{ display:flex; gap:10px; align-items:center; flex-wrap:wrap; font-size:13px; color:var(--sub); }
+.setting input[type=text]{ width:4em; border:1px solid var(--line); border-radius:5px; padding:2px 6px; }
+.setting select{ border:1px solid var(--line); border-radius:5px; padding:2px 4px; }
+.sitehead{ margin:1.2mm 0 .4mm; font-weight:700; font-size:9.6pt; }
+.code1 .box{ display:inline-block; width:6mm; height:6mm; border:1px solid var(--ink); margin-left:.8mm; vertical-align:-1.5mm; }
 </style>
 </head>
 <body>
@@ -159,8 +165,8 @@ input.dt{ width:34mm; }
   <label>登録先
     <select id="reg">
       <option value="JD-A">J-DOS study 人工関節</option>
-      <option value="JD-S" disabled>J-DOS study 脊椎（準備中）</option>
-      <option value="NC" disabled>NOCOTA-II（準備中）</option>
+      <option value="JD-S">J-DOS study 脊椎</option>
+      <option value="NC">NOCOTA-II</option>
     </select>
   </label>
   <span class="grow"></span>
@@ -175,12 +181,12 @@ input.dt{ width:34mm; }
     <span class="count" id="csvInfo">CSVが読み込まれていません</span>
   </header>
   <div class="body">
-    <div class="drop" id="drop">手術予定CSVをここにドロップするか、上の「CSVを読み込む」から選んでください</div>
+    <div class="drop" id="drop" role="button" tabindex="0">手術予定CSVをここにドロップするか、クリックして選んでください</div>
     <div id="pickArea" hidden>
       <div class="filters">
         <label>手術日 <input type="date" id="fFrom"> 〜 <input type="date" id="fTo"></label>
-        <label><input type="search" id="fWord" placeholder="患者ID・術式・病名で絞り込み" size="26"></label>
-        <label><input type="checkbox" id="fCand"> 候補（人工関節らしい術式）だけ表示</label>
+        <label><input type="search" id="fWord" placeholder="患者ID・術式・病名・執刀医で絞り込み" size="30"></label>
+        <label id="fCandWrap"><input type="checkbox" id="fCand"> <span id="fCandLabel">候補だけ表示</span></label>
         <span class="grow"></span>
         <span class="count" id="pickCount"></span>
       </div>
@@ -192,13 +198,13 @@ input.dt{ width:34mm; }
       </div>
       <div style="margin-top:10px; display:flex; gap:10px; align-items:center;">
         <button class="btn main" id="btnMake" disabled>選んだ患者の入力用紙を作る</button>
-        <span class="count">左端に青線がある行は、術式から見た候補です。最終判断は人が行ってください。</span>
+        <span class="count" id="candNote"></span>
       </div>
     </div>
   </div>
 </section>
 
-<div id="papers"><p class="empty" id="emptyMsg">患者を選ぶと、ここに入力用紙が表示されます。○をクリックすると選べます。</p></div>
+<div id="papers"></div>
 
 <script>
 /* ===== QRコード生成ライブラリ（qrcode-generator 1.4.4 / MIT License / Kazuhiko Arase）===== */
@@ -2506,6 +2512,20 @@ var qrcode = function() {
 <script>
 "use strict";
 // ============================================================
+// 院内ルール（変わったらここを直す）
+// ============================================================
+// J-DOS 脊椎：ポビドンヨード入り洗浄液を「あり」にする執刀医（フルネーム。空白は無視して比較）
+var POVIDONE_SURGEONS = ["鈴木弘仁", "辻嶋直樹"];
+// NOCOTA-II：対象の先生（患者一覧で候補として目立たせる）
+var NC_SURGEONS = ["上條秀樹", "領木勇人"];
+// NOCOTA-II：割付のスケジュール（手術日で決まる）
+//   IO=術中のみ / H24=24時間まで投与
+var NC_ALLOC = [
+  { from:"2026-08-01", to:"2026-09-30", code:"IO",  name:"術中のみ" },
+  { from:"2026-10-01", to:"2027-01-31", code:"H24", name:"24時間まで投与" }
+];
+
+// ============================================================
 // 共通ユーティリティ
 // ============================================================
 function $(id){ return document.getElementById(id); }
@@ -2513,13 +2533,12 @@ function esc(s){
   return String(s == null ? "" : s)
     .replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
 }
+function nfkc(s){ return String(s == null ? "" : s).normalize("NFKC"); }
 
-// CSVの文字コード判定（UTF-8で読めなければShift-JIS/CP932）
 function decodeBytes(buf){
   try { return new TextDecoder("utf-8", { fatal:true }).decode(buf); }
   catch (e) { return new TextDecoder("shift_jis").decode(buf); }
 }
-// 引用符・改行入りの項目に対応したCSVパーサ
 function parseCSV(text){
   var rows = [], row = [], cur = "", q = false, i = 0;
   text = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
@@ -2541,7 +2560,6 @@ function parseCSV(text){
   return rows;
 }
 
-// 半角カナ→全角カナ（画面の患者一覧用）
 var HANKAKU = "ｱｲｳｴｵｶｷｸｹｺｻｼｽｾｿﾀﾁﾂﾃﾄﾅﾆﾇﾈﾉﾊﾋﾌﾍﾎﾏﾐﾑﾒﾓﾔﾕﾖﾗﾘﾙﾚﾛﾜｦﾝｧｨｩｪｫｬｭｮｯｰ｡｢｣､･";
 var ZENKAKU = "アイウエオカキクケコサシスセソタチツテトナニヌネノハヒフヘホマミムメモヤユヨラリルレロワヲンァィゥェォャュョッー。「」、・";
 var DAKU_H = "ｶｷｸｹｺｻｼｽｾｿﾀﾁﾂﾃﾄﾊﾋﾌﾍﾎｳ", DAKU_Z = "ガギグゲゴザジズゼゾダヂヅデドバビブベボヴ";
@@ -2558,47 +2576,39 @@ function toZenkakuKana(s){
   return out;
 }
 
-// 患者IDを下6桁（ゼロ付き）にそろえる
-function patientId6(s){
-  var d = String(s == null ? "" : s).replace(/[^0-9]/g, "");
+function digitsOf(s){ return String(s == null ? "" : s).replace(/[^0-9]/g, ""); }
+function lastDigits(s, n){
+  var d = digitsOf(s);
   if (!d) return "";
-  return d.length > 6 ? d.slice(-6) : ("000000" + d).slice(-6);
+  return d.length > n ? d.slice(-n) : (new Array(n + 1).join("0") + d).slice(-n);
 }
-// 加工ID：下6桁の末尾だけ+1。9なら0（上の桁は変えない）
-function procId(s){
-  var id6 = patientId6(s);
-  if (!id6) return "";
-  var last = (parseInt(id6.slice(-1), 10) + 1) % 10;
-  return id6.slice(0, 5) + String(last);
+function patientId6(s){ return lastDigits(s, 6); }
+// 末尾だけ+1。9なら0（上の桁は変えない）
+function plusOneLast(d){
+  if (!d) return "";
+  return d.slice(0, -1) + String((parseInt(d.slice(-1), 10) + 1) % 10);
 }
-// 「2026.05.07」→ [2026,5,7]
 function ymdParts(s){
   var p = String(s || "").split(/[^0-9]+/).filter(function(x){ return x.length; });
   if (p.length < 3 || p[0].length !== 4) return null;
   return [parseInt(p[0],10), parseInt(p[1],10), parseInt(p[2],10)];
 }
 function pad2(n){ return ("0" + n).slice(-2); }
-// [y,m,d] → "2026-05-07"（input type=date 用）
 function isoOf(p){ return p ? p[0] + "-" + pad2(p[1]) + "-" + pad2(p[2]) : ""; }
-// 手術時年齢（誕生日を迎えていなければ-1）
 function ageAt(birth, op){
   if (!birth || !op) return "";
   var a = op[0] - birth[0];
   if (op[1] < birth[1] || (op[1] === birth[1] && op[2] < birth[2])) a--;
   return a;
 }
-// 「09:16」〜「09:50」の分数（日付またぎは+24時間）
 function minutesBetween(a, b){
   var ma = /^(\d{1,2}):(\d{2})/.exec(String(a || "").trim());
   var mb = /^(\d{1,2}):(\d{2})/.exec(String(b || "").trim());
   if (!ma || !mb) return "";
-  var x = parseInt(ma[1],10)*60 + parseInt(ma[2],10);
-  var y = parseInt(mb[1],10)*60 + parseInt(mb[2],10);
-  var d = y - x;
+  var d = (parseInt(mb[1],10)*60 + parseInt(mb[2],10)) - (parseInt(ma[1],10)*60 + parseInt(ma[2],10));
   if (d < 0) d += 1440;
   return d;
 }
-// 日付に日数を足す
 function addDays(iso, n){
   if (!iso) return "";
   var p = iso.split("-").map(Number);
@@ -2607,36 +2617,161 @@ function addDays(iso, n){
 }
 function numOrBlank(s){
   var t = String(s == null ? "" : s).trim();
-  if (!t || !/^[0-9.]+$/.test(t)) return "";
-  if (parseFloat(t) === 0) return "";
+  if (!t || !/^[0-9.]+$/.test(t) || parseFloat(t) === 0) return "";
   return t;
 }
 
 // ============================================================
-// CSVの読み込み状態
+// CSVの列
 // ============================================================
-var recs = [];          // CSVの症例（列名→値）
-var picked = {};        // 選択中の手術番号
-var patients = [];      // 入力用紙を作った患者
-var seq = 0;
-
 function col(r, name){ var x = r[name]; return (x == null ? "" : String(x)).trim(); }
 function opeName(r){ return col(r, "術後術式") || col(r, "術前術式"); }
 function diagName(r){ return col(r, "術後病名") || col(r, "術前病名"); }
-function isJointCandidate(r){
-  return /人工|置換|骨頭|THA|TKA|UKA|BHA/i.test(opeName(r));
-}
+function firstDiag(r){ return nfkc(diagName(r)).split(/[,、]/)[0]; }
 
 // ============================================================
-// 登録先の定義：J-DOS study 人工関節
-//   id は J-DOS のフォームの項目名（name属性）そのもの
-//   選択肢の値は J-DOS の value の先頭2桁
+// 脊椎のレベルを術式名から読む（例：L4/5、C4/5/6、L5/S、L3-S1）
+//   戻り値 { top, bottom, n }：top/bottom は通し番号（C1=1 … T1=8 … L1=20 … S1=25）
+// ============================================================
+function vIndex(letter, num){
+  if (letter === "C") return num;
+  if (letter === "T") return 7 + num;
+  if (letter === "L") return 19 + num;
+  if (letter === "S") return 24 + (num || 1);
+  return 0;
+}
+function parseLevels(text){
+  var t = nfkc(text).replace(/Th/g, "T");
+  var re = /(?<![A-Za-z])([CTLS])(\d{1,2})((?:\s*[\/\-~〜]\s*(?:[CTLS]\d{1,2}|S(?![A-Za-z])|\d{1,2}))+)(?!\d)/g;
+  var idx = [], m;
+  while ((m = re.exec(t))){
+    var letter = m[1];
+    idx.push(vIndex(letter, parseInt(m[2], 10)));
+    var rest = m[3].split(/[\/\-~〜]/).map(function(x){ return x.trim(); }).filter(Boolean);
+    rest.forEach(function(p){
+      var mm = /^([CTLS])?(\d{1,2})?$/.exec(p);
+      if (!mm) return;
+      if (mm[1]) letter = mm[1];
+      idx.push(vIndex(letter, mm[2] ? parseInt(mm[2], 10) : (letter === "S" ? 1 : 0)));
+    });
+  }
+  idx = idx.filter(function(x){ return x > 0; });
+  if (!idx.length) return null;
+  var top = Math.min.apply(null, idx), bottom = Math.max.apply(null, idx);
+  if (bottom === top) return null;
+  return { top:top, bottom:bottom, n:bottom - top };
+}
+function regionOf(i){ return i <= 7 ? "C" : (i <= 19 ? "T" : (i <= 24 ? "L" : "S")); }
+
+// ============================================================
+// 項目定義の部品
+//   id：画面の状態のキー / qn：登録サイトの項目名（id と違うときだけ書く）
 // ============================================================
 var YN = [["01","なし"],["02","あり"]];
+var OPT_SEX = [["01","男"],["02","女"]];
+var OPT_ASA6 = [["01","1"],["02","2"],["03","3"],["04","4"],["05","5"],["06","6"]];
+function hand(id, label, text){ return { id:id, label:label, kind:"hand", text:text }; }
 
-// 推定ルール：人工関節の種類
+// J-DOS 共通：新規登録
+function jdNewSheet(fixedText){
+  return {
+    code:"NEW", title:"新規登録", qr:true, fixed:fixedText,
+    fields:[
+      { id:"AGE",  qn:"N0010", label:"手術時年齢", kind:"num", unit:"歳" },
+      { id:"BMON", qn:"N0075", label:"誕生月", kind:"num", unit:"月" },
+      { id:"SEX",  qn:"R0011", label:"性別", kind:"radio", opts:OPT_SEX },
+      { id:"PID",  label:"加工ID", kind:"pid", ids:["T0072","T0073"], note:"ID（再入力）にも同じ値が入ります" }
+    ]
+  };
+}
+// J-DOS 共通：輸血
+function jdTransfusion(){
+  return [
+    { id:"R0236", label:"輸血", kind:"radio", opts:YN },
+    { id:"G_TRF", label:"輸血の種類", kind:"checks", sub:true, when:function(s){ return s.R0236 === "02"; },
+      items:[["C0237","術前貯血自己血"],["C0238","他家血"],["C0239","術中回収自己血"],["C0240","術後回収自己血"]] }
+  ];
+}
+// J-DOS 共通：尿カテ・血糖
+function jdUrineGlucose(){
+  return [
+    { id:"R0302", label:"尿路カテーテル", kind:"radio", opts:[["01","なし"],["02","24時間未満"],["03","24時間以上48時間未満"],["04","48時間以上"]] },
+    { id:"R0303", label:"術後24時間以内の最高血糖値", kind:"radio", opts:[["01","測定した"],["02","未測定"]] },
+    { id:"N0304", label:"数値", kind:"num", unit:"mg/dl", sub:true, when:function(s){ return s.R0303 === "01"; } },
+    { id:"T0305", label:"未測定の理由", kind:"textcode", sub:true, when:function(s){ return s.R0303 === "02"; },
+      opts:[["K1","糖尿病ではないため"]], note:"他の理由はJ-DOSで手入力" }
+  ];
+}
+// J-DOS 共通：SSI（手書き）
+function jdSsiSheet(reopText){
+  return {
+    code:"SSI", title:"SSI（術後90日以降に記入）", qr:false,
+    fields:[
+      { id:"D_SSI", label:"最後に評価した日の目安", kind:"show",
+        show:function(P){ var d = addDays(P.st.OPD, 90); return d ? d.replace(/-/g, "/") + "（手術日の90日後）以降" : "手術日が入ると表示されます"; } },
+      hand("H1", "最終評価の方法", "○直接評価　○間接評価 →（　　　　　　）　○連絡とれず"),
+      hand("H2", "SSIの有無", "○なし　○あり　○確認できず"),
+      hand("H3", "SSIに対する再手術", reopText),
+      hand("H4", "抗菌薬の追加投与", "○なし　○あり（SSI疑いに対する、予防的投与以外）"),
+      hand("H5", "SSI以外の感染症", "○なし　○あり →（□尿路　□呼吸器　□採骨部　□その他）"),
+      hand("H6", "感染以外の再手術", "○なし　○あり →（　　　　　　　　）"),
+      hand("H7", "転帰", "○生存　○死亡（○SSIが寄与　○SSIと無関係）　死亡日　　年　　月　　日"),
+      hand("H8", "再入院", "○なし　○あり（○SSI評価・治療目的　○SSIと無関係）　○不明")
+    ]
+  };
+}
+// 糖尿病ありを選んだら、いつもの値「未測定（糖尿病ではないため）」を外す
+function jdOnSet(P, id, v){
+  if (id === "R0141" && v !== "01" && P.st.R0303 === "02" && P.src.R0303 === "init"){
+    delete P.st.R0303; delete P.st.T0305; delete P.src.R0303; delete P.src.T0305;
+  }
+}
+
+// CSVから共通の値を入れる
+function initCommon(P, put, idRule){
+  var r = P.r;
+  var birth = ymdParts(col(r, "生年月日")), op = ymdParts(col(r, "手術日")), adm = ymdParts(col(r, "入院日"));
+  put("AGE", String(ageAt(birth, op)), "csv");
+  if (birth) put("BMON", String(birth[1]), "csv");
+  var sex = col(r, "性別");
+  put("SEX", sex === "男" ? "01" : (sex === "女" ? "02" : ""), "csv");
+  put("PID", idRule(col(r, "患者番号")), "csv");
+  put("ADM", isoOf(adm), "csv");
+  put("OPD", isoOf(op), "csv");
+  put("HT", numOrBlank(col(r, "身長")), "csv");
+  put("WT", numOrBlank(col(r, "体重")), "csv");
+  put("OPMIN", String(minutesBetween(col(r, "執刀開始時刻"), col(r, "執刀終了時刻"))), "csv");
+  var bl = col(r, "出血量");
+  if (/^[0-9.]+$/.test(bl)) put("BLOOD", parseFloat(bl) === 0 ? "1" : bl, "csv");
+}
+function jdInitTransfusion(P, put){
+  var stored = parseFloat(col(P.r, "保存血液輸血量")) || 0;
+  var auto = parseFloat(col(P.r, "自己血液輸血量")) || 0;
+  if (stored > 0 || auto > 0){
+    put("R0236", "02", "guess");
+    if (stored > 0){ P.st.C0238 = true; P.src.G_TRF = "guess"; }
+  } else put("R0236", "01", "csv");
+}
+function commonWarnings(P, w){
+  var s = P.st;
+  if (s.AGE !== undefined && s.AGE !== "" && parseInt(s.AGE, 10) < 18) w.push("手術時年齢が18歳未満です（選択基準）");
+  if (!s.OPMIN) w.push("CSVに執刀開始・終了時刻がないため、手術時間を計算できませんでした");
+  if (!s.HT || !s.WT) w.push("CSVに身長または体重がありません");
+  if (!s.PID) w.push("患者番号から加工IDを作れませんでした");
+}
+function jdWarnings(P, w){
+  var s = P.st;
+  if (s.R0141 && s.R0141 !== "01" && s.R0303 === "02" && s.T0305 === "K1") w.push("糖尿病ありなのに、血糖が「未測定（糖尿病ではないため）」になっています");
+  if (s.R0236 === "02" && !(s.C0237 || s.C0238 || s.C0239 || s.C0240)) w.push("輸血ありですが、種類が選ばれていません");
+  if ((parseFloat(col(P.r, "自己血液輸血量")) || 0) > 0) w.push("CSVに自己血の輸血量があります。種類（術前貯血／術中回収／術後回収）を確認してください");
+}
+function jdIdRule(raw){ return plusOneLast(patientId6(raw)); }
+
+// ============================================================
+// J-DOS study 人工関節
+// ============================================================
 function guessJointKind(r){
-  var t = opeName(r);
+  var t = nfkc(opeName(r));
   if (/腫瘍/.test(t)) return "05";
   if (/単顆|UKA/i.test(t)) return "04";
   if (/膝|TKA/i.test(t)) return "03";
@@ -2644,7 +2779,6 @@ function guessJointKind(r){
   if (/股|THA/i.test(t)) return "01";
   return "";
 }
-// 推定ルール：原疾患
 function guessJointDisease(r){
   var t = diagName(r);
   if (/腫瘍/.test(t)) return "05";
@@ -2653,216 +2787,575 @@ function guessJointDisease(r){
   if (/変形性/.test(t)) return "01";
   return "";
 }
+var JDA_SHEETS = [
+  jdNewSheet("症例の分類：人工関節置換術症例／選択基準：満たす／非選択基準：該当しない／同意取得方法：オプトアウト"),
+  {
+    code:"HAI", title:"背景", qr:true,
+    fixed:"鼻腔除菌：なし／術前の皮膚準備（除菌）：あり",
+    fields:[
+      { id:"ADM", label:"入院日", kind:"date", ids:["N0106","N0107","N0108"] },
+      { id:"R0101", label:"人工関節の種類", kind:"radio", opts:[
+          ["01","人工股関節全置換術"],["02","股関節人工骨頭挿入術"],["03","人工膝関節全置換術"],
+          ["04","単顆型人工膝関節置換術（UKA）"],["05","腫瘍型人工関節"]] },
+      { id:"R0112", label:"腫瘍型の部位", kind:"radio", sub:true, when:function(s){ return s.R0101 === "05"; },
+        opts:[["01","骨盤"],["02","大腿骨近位"],["03","大腿骨遠位"],["04","脛骨近位"],["05","全大腿骨"]] },
+      { id:"HT", qn:"N0104", label:"身長", kind:"num", unit:"cm" },
+      { id:"WT", qn:"N0105", label:"体重", kind:"num", unit:"kg" },
+      { id:"R0111", label:"原疾患", kind:"radio", opts:[
+          ["01","変形性関節症"],["02","関節リウマチ"],["03","骨壊死"],["05","腫瘍・腫瘍類似疾患"],["09","その他"]],
+        after:function(s){ return s.R0111 === "09" ? '<span class="note">→ 具体的に（手書き・J-DOSで手入力）</span><span class="hand"></span>' : ""; } },
+      { id:"ACT_NONE", label:"既往・術前合併症", kind:"action", btn:"全てなしにする",
+        keys:["R0141","R0144","R0145","R0147","R0148","R0149","R0151","R0160","R0162"] },
+      { id:"R0141", label:"糖尿病", kind:"radio", opts:[
+          ["01","なし"],["02","あり（食事療法）"],["03","あり（経口薬）"],["04","あり（インスリン療法）"],["06","あり（GLP-1注射）"],["05","あり（未投薬）"]],
+        note:"GLP-1投薬の場合は「あり（経口薬）」" },
+      { id:"R0144", label:"透析", kind:"radio", opts:YN },
+      { id:"R0145", label:"関節リウマチ", kind:"radio", opts:YN },
+      { id:"R0147", label:"膠原病", kind:"radio", opts:YN, note:"関節リウマチ以外" },
+      { id:"R0148", label:"免疫不全", kind:"radio", opts:YN },
+      { id:"R0149", label:"治療中の皮膚疾患", kind:"radio", opts:YN },
+      { id:"R0151", label:"当該関節の手術歴", kind:"radio", opts:YN },
+      { id:"R0160", label:"ステロイド内服", kind:"radio", opts:YN, note:"手術決定時の副腎皮質ステロイド" },
+      { id:"N0161", label:"用量", kind:"num", unit:"mg/日（プレドニン換算）", sub:true, when:function(s){ return s.R0160 === "02"; } },
+      { id:"R0162", label:"免疫調整薬など", kind:"radio", opts:YN, note:"免疫調整薬・免疫抑制薬・生物学的製剤・JAK阻害薬" },
+      { id:"G_IMM", label:"種類（複数可）", kind:"checks", sub:true, when:function(s){ return s.R0162 === "02"; },
+        items:[["C0164","免疫調節薬"],["C0166","免疫抑制薬"],["C0168","生物学的製剤"],["C0170","JAK"]] },
+      { id:"R0165", label:"免疫調節薬の休薬", kind:"radio", opts:YN, sub:true, when:function(s){ return s.R0162 === "02" && s.C0164; } },
+      { id:"R0167", label:"免疫抑制薬の休薬", kind:"radio", opts:YN, sub:true, when:function(s){ return s.R0162 === "02" && s.C0166; } },
+      { id:"R0169", label:"生物学的製剤の休薬", kind:"radio", opts:YN, sub:true, when:function(s){ return s.R0162 === "02" && s.C0168; } },
+      { id:"R0171", label:"JAKの休薬", kind:"radio", opts:YN, sub:true, when:function(s){ return s.R0162 === "02" && s.C0170; } }
+    ]
+  },
+  {
+    code:"OPE", title:"手術", qr:true,
+    fixed:"予防抗菌薬：あり（セファゾリン）／投与開始：執刀開始前（1時間未満〜執刀直前）／投与期間：術後24時間未満／" +
+          "最終消毒：アルコール含有ポビドンヨード／粘着ドレープ：あり（ヨードあり）／ポビドンヨード入り洗浄液：なし／" +
+          "抗菌性縫合糸：あり／全身排気スーツ：なし／バイオクリーンルーム：なし",
+    fields:[
+      { id:"OPD", label:"手術日", kind:"date", ids:["N0202","N0203","N0204"] },
+      { id:"R0211", label:"骨セメント", kind:"radio", opts:[["01","なし"],["02","あり（抗菌薬あり）"],["03","あり（抗菌薬なし）"]] },
+      { id:"R0231", label:"ASA分類", kind:"radio", opts:OPT_ASA6 },
+      { id:"OPMIN", qn:"N0233", label:"手術時間", kind:"num", unit:"分", note:"執刀開始〜執刀終了" },
+      { id:"BLOOD", qn:"N0234", label:"術中出血量", kind:"num", unit:"ml", note:"ごく少量は1" }
+    ].concat(jdTransfusion())
+  },
+  {
+    code:"DRA", title:"術後", qr:true,
+    fixed:"ドレーン留置期間：なし（ドレーンを使用していない）",
+    fields:jdUrineGlucose()
+  },
+  jdSsiSheet("○なし　○あり →（○洗浄・デブリのみ　○インプラント抜去　○一期的再置換　○その他）")
+];
 
 var DEF_JDA = {
   key:"JD-A", reg:"JD", type:"A",
   title:"J-DOS study 人工関節 入力用紙",
-  code1Hint:"1066 02",
-  sheets:[
-    {
-      code:"NEW", title:"新規登録", qr:true,
-      fixed:"症例の分類：人工関節置換術症例／選択基準：満たす／非選択基準：該当しない／同意取得方法：オプトアウト",
-      fields:[
-        { id:"N0010", label:"手術時年齢", kind:"num", unit:"歳" },
-        { id:"N0075", label:"誕生月", kind:"num", unit:"月" },
-        { id:"R0011", label:"性別", kind:"radio", opts:[["01","男"],["02","女"]] },
-        { id:"PID",   label:"加工ID", kind:"pid", ids:["T0072","T0073"], note:"ID（再入力）にも同じ値が入ります" }
-      ]
-    },
-    {
-      code:"HAI", title:"背景", qr:true,
-      fixed:"鼻腔除菌：なし／術前の皮膚準備（除菌）：あり",
-      fields:[
-        { id:"D_ADM", label:"入院日", kind:"date", ids:["N0106","N0107","N0108"] },
-        { id:"R0101", label:"人工関節の種類", kind:"radio", opts:[
-            ["01","人工股関節全置換術"],["02","股関節人工骨頭挿入術"],["03","人工膝関節全置換術"],
-            ["04","単顆型人工膝関節置換術（UKA）"],["05","腫瘍型人工関節"]] },
-        { id:"R0112", label:"腫瘍型の部位", kind:"radio", sub:true, when:function(s){ return s.R0101 === "05"; },
-          opts:[["01","骨盤"],["02","大腿骨近位"],["03","大腿骨遠位"],["04","脛骨近位"],["05","全大腿骨"]] },
-        { id:"N0104", label:"身長", kind:"num", unit:"cm" },
-        { id:"N0105", label:"体重", kind:"num", unit:"kg" },
-        { id:"R0111", label:"原疾患", kind:"radio", opts:[
-            ["01","変形性関節症"],["02","関節リウマチ"],["03","骨壊死"],["05","腫瘍・腫瘍類似疾患"],["09","その他"]],
-          after:function(s){ return s.R0111 === "09" ? '<span class="note">→ 具体的に（手書き・J-DOSで手入力）</span><span class="hand"></span>' : ""; } },
-        { id:"ACT_NONE", label:"既往・術前合併症", kind:"action", btn:"全てなしにする",
-          run:function(P){ ["R0141","R0144","R0145","R0147","R0148","R0149","R0151","R0160","R0162"].forEach(function(k){ setVal(P, k, "01", "user"); }); } },
-        { id:"R0141", label:"糖尿病", kind:"radio", opts:[
-            ["01","なし"],["02","あり（食事療法）"],["03","あり（経口薬）"],["04","あり（インスリン療法）"],["06","あり（GLP-1注射）"],["05","あり（未投薬）"]],
-          note:"GLP-1投薬の場合は「あり（経口薬）」" },
-        { id:"R0144", label:"透析", kind:"radio", opts:YN },
-        { id:"R0145", label:"関節リウマチ", kind:"radio", opts:YN },
-        { id:"R0147", label:"膠原病", kind:"radio", opts:YN, note:"関節リウマチ以外" },
-        { id:"R0148", label:"免疫不全", kind:"radio", opts:YN },
-        { id:"R0149", label:"治療中の皮膚疾患", kind:"radio", opts:YN },
-        { id:"R0151", label:"当該関節の手術歴", kind:"radio", opts:YN },
-        { id:"R0160", label:"ステロイド内服", kind:"radio", opts:YN, note:"手術決定時の副腎皮質ステロイド" },
-        { id:"N0161", label:"用量", kind:"num", unit:"mg/日（プレドニン換算）", sub:true, when:function(s){ return s.R0160 === "02"; } },
-        { id:"R0162", label:"免疫調整薬など", kind:"radio", opts:YN, note:"免疫調整薬・免疫抑制薬・生物学的製剤・JAK阻害薬" },
-        { id:"G_IMM", label:"種類（複数可）", kind:"checks", sub:true, when:function(s){ return s.R0162 === "02"; },
-          items:[["C0164","免疫調節薬"],["C0166","免疫抑制薬"],["C0168","生物学的製剤"],["C0170","JAK"]] },
-        { id:"R0165", label:"免疫調節薬の休薬", kind:"radio", opts:YN, sub:true, when:function(s){ return s.R0162 === "02" && s.C0164; } },
-        { id:"R0167", label:"免疫抑制薬の休薬", kind:"radio", opts:YN, sub:true, when:function(s){ return s.R0162 === "02" && s.C0166; } },
-        { id:"R0169", label:"生物学的製剤の休薬", kind:"radio", opts:YN, sub:true, when:function(s){ return s.R0162 === "02" && s.C0168; } },
-        { id:"R0171", label:"JAKの休薬", kind:"radio", opts:YN, sub:true, when:function(s){ return s.R0162 === "02" && s.C0170; } }
-      ]
-    },
-    {
-      code:"OPE", title:"手術", qr:true,
-      fixed:"予防抗菌薬：あり（セファゾリン）／投与開始：執刀開始前（1時間未満〜執刀直前）／投与期間：術後24時間未満／" +
-            "最終消毒：アルコール含有ポビドンヨード／粘着ドレープ：あり（ヨードあり）／ポビドンヨード入り洗浄液：なし／" +
-            "抗菌性縫合糸：あり／全身排気スーツ：なし／バイオクリーンルーム：なし",
-      fields:[
-        { id:"D_OPE", label:"手術日", kind:"date", ids:["N0202","N0203","N0204"] },
-        { id:"R0211", label:"骨セメント", kind:"radio", opts:[["01","なし"],["02","あり（抗菌薬あり）"],["03","あり（抗菌薬なし）"]] },
-        { id:"R0231", label:"ASA分類", kind:"radio", opts:[["01","1"],["02","2"],["03","3"],["04","4"],["05","5"],["06","6"]] },
-        { id:"N0233", label:"手術時間", kind:"num", unit:"分", note:"執刀開始〜執刀終了" },
-        { id:"N0234", label:"術中出血量", kind:"num", unit:"ml", note:"ごく少量は1" },
-        { id:"R0236", label:"輸血", kind:"radio", opts:YN },
-        { id:"G_TRF", label:"輸血の種類", kind:"checks", sub:true, when:function(s){ return s.R0236 === "02"; },
-          items:[["C0237","術前貯血自己血"],["C0238","他家血"],["C0239","術中回収自己血"],["C0240","術後回収自己血"]] }
-      ]
-    },
-    {
-      code:"DRA", title:"術後", qr:true,
-      fixed:"ドレーン留置期間：なし（ドレーンを使用していない）",
-      fields:[
-        { id:"R0302", label:"尿路カテーテル", kind:"radio", opts:[["01","なし"],["02","24時間未満"],["03","24時間以上48時間未満"],["04","48時間以上"]] },
-        { id:"R0303", label:"術後24時間以内の最高血糖値", kind:"radio", opts:[["01","測定した"],["02","未測定"]] },
-        { id:"N0304", label:"数値", kind:"num", unit:"mg/dl", sub:true, when:function(s){ return s.R0303 === "01"; } },
-        { id:"T0305", label:"未測定の理由", kind:"textcode", sub:true, when:function(s){ return s.R0303 === "02"; },
-          opts:[["K1","糖尿病ではないため"]], note:"他の理由はJ-DOSで手入力" }
-      ]
-    },
-    {
-      code:"SSI", title:"SSI（術後90日以降に記入）", qr:false,
-      fields:[
-        { id:"D_SSI", label:"最後に評価した日の目安", kind:"show",
-          show:function(P){ var d = addDays(P.st.D_OPE, 90); return d ? d.replace(/-/g, "/") + "（手術日の90日後）以降" : "手術日が入ると表示されます"; } },
-        { id:"H1", label:"最終評価の方法", kind:"hand", text:"○直接評価　○間接評価 →（　　　　　　）　○連絡とれず" },
-        { id:"H2", label:"SSIの有無", kind:"hand", text:"○なし　○あり　○確認できず" },
-        { id:"H3", label:"SSIに対する再手術", kind:"hand", text:"○なし　○あり →（○洗浄・デブリのみ　○インプラント抜去　○一期的再置換　○その他）" },
-        { id:"H4", label:"抗菌薬の追加投与", kind:"hand", text:"○なし　○あり（SSI疑いに対する、予防的投与以外）" },
-        { id:"H5", label:"SSI以外の感染症", kind:"hand", text:"○なし　○あり →（□尿路　□呼吸器　□採骨部　□その他）" },
-        { id:"H6", label:"感染以外の再手術", kind:"hand", text:"○なし　○あり →（　　　　　　　　）" },
-        { id:"H7", label:"転帰", kind:"hand", text:"○生存　○死亡（○SSIが寄与　○SSIと無関係）　死亡日　　年　　月　　日" },
-        { id:"H8", label:"再入院", kind:"hand", text:"○なし　○あり（○SSI評価・治療目的　○SSIと無関係）　○不明" }
-      ]
-    }
-  ]
+  code1Head:"1066", code1Len:5,
+  candLabel:"候補（人工関節らしい術式）だけ表示",
+  isCand:function(r){ return /人工|置換|骨頭|THA|TKA|UKA|BHA/i.test(nfkc(opeName(r))); },
+  idRule:jdIdRule,
+  sheets:function(){ return JDA_SHEETS; },
+  init:function(P, put){
+    initCommon(P, put, jdIdRule);
+    put("R0101", guessJointKind(P.r), "guess");
+    put("R0111", guessJointDisease(P.r), "guess");
+    if (/リウマチ/.test(diagName(P.r))) put("R0145", "02", "guess");
+    jdInitTransfusion(P, put);
+    put("R0302", "02", "init"); put("R0303", "02", "init"); put("T0305", "K1", "init");
+  },
+  onSet:jdOnSet,
+  warnings:function(P){
+    var w = [], ope = opeName(P.r), s = P.st;
+    if (/再置換|抜去|入れ替え|入替|両/.test(ope)) w.push("術式に「再置換・抜去・両」などの語があります（非選択基準：再置換手術／複数部位）。対象かどうか確認してください");
+    if (/骨折/.test(diagName(P.r))) w.push("病名に「骨折」があります（非選択基準：大腿骨近位部骨折）。対象かどうか確認してください");
+    if (!s.R0101) w.push("人工関節の種類を術式から推定できませんでした");
+    commonWarnings(P, w); jdWarnings(P, w);
+    return w;
+  }
 };
 
-var DEFS = { "JD-A": DEF_JDA };
-
-// 定義から項目を引く
-function allFields(def){
-  var out = [];
-  def.sheets.forEach(function(sh){ sh.fields.forEach(function(f){ out.push(f); }); });
-  return out;
+// ============================================================
+// J-DOS study 脊椎
+// ============================================================
+function guessSpineMethod(r){
+  var t = nfkc(opeName(r));
+  if (/前後|前方後方/.test(t)) return "07";
+  if (/LLIF|OLIF|XLIF|側方進入|(?<!後)側方/i.test(t)) return "06";
+  if (/前方/.test(t)) return "05";
+  if (/PSO|VCR|骨切/i.test(t)) return "03";
+  if (/TLIF|PLIF|LIF|椎体間|後方椎体固定/i.test(t)) return "02";
+  if (/後側方|PLF/i.test(t)) return "01";
+  if (/PPS|経皮的椎弓根/i.test(t)) return "04";
+  return "";
 }
-function findField(def, id){
-  var a = allFields(def);
-  for (var i=0;i<a.length;i++) if (a[i].id === id) return a[i];
+function guessSpineDisease(r){
+  var t = firstDiag(r);
+  if (/腫瘍|転移/.test(t)) return "03";
+  if (/リウマチ/.test(t)) return "04";
+  if (/透析/.test(t)) return "05";
+  if (/圧迫骨折|脆弱|骨粗鬆/.test(t)) return "06";
+  if (/骨折|脱臼/.test(t)) return "07";
+  if (/狭窄|すべり|ヘルニア|変性|骨化|弯|症/.test(t)) return "01";
+  return "";
+}
+function isPovidoneSurgeon(r){
+  var d = col(r, "執刀医").replace(/\s/g, "");
+  return POVIDONE_SURGEONS.some(function(n){ return n && d === n.replace(/\s/g, ""); });
+}
+var JDS_SHEETS = [
+  jdNewSheet("症例の分類：脊椎インストゥルメント症例／選択基準：満たす／非選択基準：該当しない／同意取得方法：オプトアウト"),
+  {
+    code:"HAI", title:"背景", qr:true,
+    fixed:"鼻腔除菌：なし／術前の皮膚準備（除菌）：なし",
+    fields:[
+      { id:"ADM", label:"入院日", kind:"date", ids:["N0106","N0107","N0108"] },
+      { id:"R0102", label:"術式", kind:"radio", opts:[
+          ["01","後側方固定（除圧を伴うPPSを含む）"],["02","後方椎体間固定（骨切りなし）"],["03","後方椎体間固定（PSO・VCRなど骨切りあり）"],
+          ["04","PPS固定のみ（除圧なし）"],["05","前方（除圧）固定（LLIF除く）"],["06","側方進入前方固定（LLIF：OLIF・XLIFなど）"],
+          ["07","前後合併手術"],["09","その他"]],
+        after:function(s){ return s.R0102 === "09" ? '<span class="note">→ 内容（手書き・J-DOSで手入力）</span><span class="hand"></span>' : ""; } },
+      { id:"HT", qn:"N0104", label:"身長", kind:"num", unit:"cm" },
+      { id:"WT", qn:"N0105", label:"体重", kind:"num", unit:"kg" },
+      { id:"R0121", label:"原疾患", kind:"radio", opts:[
+          ["01","変性疾患"],["06","脆弱性骨折（圧迫骨折）"],["07","外傷による骨折"],["03","腫瘍"],
+          ["04","関節リウマチに伴う脊椎病変"],["05","透析に伴う脊椎病変"],["09","その他"]],
+        after:function(s){ return s.R0121 === "09" ? '<span class="note">→ 具体的に（手書き・J-DOSで手入力）</span><span class="hand"></span>' : ""; } },
+      { id:"ACT_NONE", label:"既往・術前合併症", kind:"action", btn:"全てなしにする", keys:["R0141","R0144","R0145","R0149","R0152"] },
+      { id:"R0141", label:"糖尿病", kind:"radio", opts:[
+          ["01","なし"],["02","あり（食事療法）"],["03","あり（経口薬）"],["04","あり（インスリン療法）"],["06","あり（GLP-1注射）"],["05","あり（未投薬）"]],
+        note:"GLP-1投薬の場合は「あり（経口薬）」" },
+      { id:"R0144", label:"透析", kind:"radio", opts:YN },
+      { id:"R0145", label:"関節リウマチ", kind:"radio", opts:YN },
+      { id:"R0149", label:"治療中の皮膚疾患", kind:"radio", opts:YN },
+      { id:"R0152", label:"当該部位の手術歴", kind:"radio", opts:YN }
+    ]
+  },
+  {
+    code:"OPE", title:"手術", qr:true,
+    fixed:"予防抗菌薬：あり（セファゾリン）／投与開始：執刀開始前（1時間未満〜執刀直前）／最終消毒：アルコール含有ポビドンヨード／" +
+          "粘着ドレープ：あり（ヨードあり）／抗菌性縫合糸：あり／VCMパウダー：なし／全身排気スーツ：なし／バイオクリーンルーム：なし",
+    fields:[
+      { id:"OPD", label:"手術日", kind:"date", ids:["N0202","N0203","N0204"] },
+      { id:"R0221", label:"手術部位（頭側端）", kind:"radio", opts:[["01","頭部"],["02","頸椎"],["03","胸椎"],["04","腰椎"]] },
+      { id:"R0222", label:"手術部位（尾側端）", kind:"radio", opts:[["02","頸椎"],["03","胸椎"],["04","腰椎"],["05","仙椎"],["06","骨盤"]] },
+      { id:"N0225", label:"固定椎間数", kind:"num", unit:"椎間" },
+      { id:"R0231", label:"ASA分類", kind:"radio", opts:OPT_ASA6 },
+      { id:"OPMIN", qn:"N0233", label:"手術時間", kind:"num", unit:"分", note:"執刀開始〜執刀終了" },
+      { id:"BLOOD", qn:"N0234", label:"術中出血量", kind:"num", unit:"ml", note:"ごく少量は1" }
+    ].concat(jdTransfusion()).concat([
+      { id:"R0278", label:"抗菌薬の投与期間", kind:"radio", opts:[["03","術後24時間未満"],["04","術後24時間以上〜48時間未満"],["05","術後48時間以上"]] },
+      { id:"R0287", label:"ポビドンヨード入り洗浄液", kind:"radio", opts:YN, note:"鈴木弘仁先生・辻嶋直樹先生のみあり" }
+    ])
+  },
+  {
+    code:"DRA", title:"術後", qr:true,
+    fields:[
+      { id:"R0301", label:"ドレーン留置期間", kind:"radio", opts:[["01","なし"],["02","術後24時間未満"],["03","24時間以上48時間未満"],["04","48時間以上72時間未満"],["05","72時間以上"]] }
+    ].concat(jdUrineGlucose())
+  },
+  jdSsiSheet("○なし　○あり →（○洗浄・デブリのみ　○インストゥルメント抜去　○その他）")
+];
+
+var DEF_JDS = {
+  key:"JD-S", reg:"JD", type:"S",
+  title:"J-DOS study 脊椎 入力用紙",
+  code1Head:"1066", code1Len:5,
+  candLabel:"候補（脊椎固定らしい術式）だけ表示",
+  isCand:function(r){
+    var t = nfkc(opeName(r));
+    if (/関節固定|腱固定|除去|抜釘|抜去/.test(t)) return false;
+    return /固定|LIF|PLF|PPS|スクリュー|ロッド|Rod|インスト/i.test(t);
+  },
+  idRule:jdIdRule,
+  sheets:function(){ return JDS_SHEETS; },
+  init:function(P, put){
+    initCommon(P, put, jdIdRule);
+    put("R0102", guessSpineMethod(P.r), "guess");
+    put("R0121", guessSpineDisease(P.r), "guess");
+    var t = nfkc(opeName(P.r));
+    var lv = parseLevels(t);
+    if (lv){
+      var top = regionOf(lv.top), bottom = regionOf(lv.bottom);
+      put("R0221", { C:"02", T:"03", L:"04", S:"" }[top], "guess");
+      put("R0222", { C:"02", T:"03", L:"04", S:"05" }[bottom], "guess");
+      put("N0225", String(lv.n), "guess");
+    }
+    if (/後頭/.test(t)) put("R0221", "01", "guess");
+    if (/骨盤|腸骨|S2AI/i.test(t)) put("R0222", "06", "guess");
+    jdInitTransfusion(P, put);
+    put("R0287", isPovidoneSurgeon(P.r) ? "02" : "01", "guess");
+    put("R0278", "03", "init");
+    put("R0301", "02", "init");
+    put("R0302", "02", "init"); put("R0303", "02", "init"); put("T0305", "K1", "init");
+  },
+  onSet:jdOnSet,
+  warnings:function(P){
+    var w = [], t = nfkc(opeName(P.r)), s = P.st;
+    if (!/固定|TLIF|PLIF|PLF|LLIF|OLIF|XLIF|PPS|スクリュー|ロッド|Rod|インスト/i.test(t)) w.push("術式からインストゥルメントの使用が読み取れません（非選択基準：インストゥルメントを使用しなかった場合）");
+    if (/創外固定|ピンニング/.test(t)) w.push("体外に露出する固定の可能性があります（非選択基準）");
+    if (!s.R0102) w.push("術式を推定できませんでした");
+    if (!s.N0225) w.push("術式名から固定レベルを読めませんでした。手術部位と固定椎間数を入れてください");
+    else if (s.R0221 && s.R0222) w.push("手術部位と固定椎間数は術式名からの推定です（" + opeName(P.r) + "）。手術記録で確認してください");
+    commonWarnings(P, w); jdWarnings(P, w);
+    return w;
+  }
+};
+
+// ============================================================
+// NOCOTA-II
+// ============================================================
+// NOCOTA-II の加工IDは J-DOS と同じ（下6桁の末尾+1、9なら0）。症例コード2（R＋誕生月＋ID）はサイトが自動で付ける
+function ncIdRule(raw){ return jdIdRule(raw); }
+function ncAllocOf(iso){
+  for (var i=0;i<NC_ALLOC.length;i++) if (iso && iso >= NC_ALLOC[i].from && iso <= NC_ALLOC[i].to) return NC_ALLOC[i];
+  return null;
+}
+
+// 手術術式（手術2）の選択肢：[値, 文言, 大分類]
+var NC_OPE = [
+  ["", "■股関節のORIF（大腿頸部骨折、転子部骨折、転子下骨折）"],
+  ["01","股関節髄内釘（Gamma、PFNA、ITSTなど）","01"],["02","股関節スクリュー（CCHS、ハンソンピンなど）","01"],["03","股関節プレート（CHS、DHSなど）","01"],
+  ["", "■その他のORIF（脊椎、股関節以外）"],
+  ["08","プレートなど","01"],["09","髄内釘・Ender釘など","01"],["10","スクリュー・ワイヤーのみ","01"],["11","偽関節手術","01"],["12","骨盤寛骨臼後方ORIF","01"],["13","骨盤寛骨臼前方・恥坐骨ORIF","01"],
+  ["", "■人工関節・人工骨頭"],
+  ["14","人工骨頭（股）","02"],["15","THA","02"],["16","リビジョンTHA","02"],["17","TKA","02"],["18","UKA","02"],["19","リビジョンTKA","02"],["20","リビジョンUKA","02"],
+  ["21","RSA（リバース）","02"],["22","TSA","02"],["23","人工骨頭（肩）","02"],["24","TEA","02"],["25","リビジョンTEA","02"],["26","TAA","02"],["27","リビジョンTAA","02"],["98","その他（人工関節）","02"],
+  ["", "■関節固定／形成／切除"],
+  ["28","関節固定術","03"],["29","関節形成術","03"],["30","関節唇形成","03"],["31","関節制動術","03"],
+  ["", "■骨切り、変形矯正（脊椎以外）"],
+  ["34","高位脛骨骨切り術","04"],["35","大腿骨近位骨切り術","04"],["36","寛骨臼・骨盤骨切り術","04"],["37","変形治癒骨折矯正手術","04"],
+  ["", "■脊椎手術（インストなし）"],
+  ["41","腰椎後方","05"],["42","腰椎前方","05"],["43","頚椎後方","05"],["44","頚椎前方","05"],["45","胸椎後方","05"],["46","胸椎前方","05"],["47","頚胸椎後方","05"],["48","頚胸椎前方","05"],["49","胸腰椎後方","05"],["50","胸腰椎前方","05"],
+  ["", "■脊椎手術（インストあり）"],
+  ["51","腰椎後方","06"],["52","腰椎前方","06"],["53","頚椎後方","06"],["54","頚椎前方","06"],["55","胸椎後方","06"],["56","胸椎前方","06"],["57","頚胸椎後方","06"],["58","頚胸椎前方","06"],["59","胸腰椎後方","06"],["60","胸腰椎前方","06"],
+  ["", "■関節鏡、内視鏡（脊椎以外）"],
+  ["61","半月板手術","07"],["62","靭帯断裂手術","07"],["63","滑膜切除","07"],["64","腱板断裂手術","07"],["65","肩関節唇形成術","07"],["66","肩関節授動術","07"],
+  ["", "■腫瘍"],
+  ["71","骨腫瘍切除術","08"],["76","軟部腫瘍切除術","09"],
+  ["", "■その他"],
+  ["81","手根管開放","10"],["82","肘部管除圧","10"],["83","アキレス腱縫合","10"],["84","その他腱縫合術","10"],["85","肩鎖関節脱臼手術","10"],["99","その他","10"]
+];
+function ncOpeGroup(code){
+  for (var i=0;i<NC_OPE.length;i++) if (NC_OPE[i][0] === code) return NC_OPE[i][2] || "";
+  return "";
+}
+var NC_SITE = [
+  ["01","1.前頚部"],["02","2.項部"],["03","3.胸椎・背部"],["04","4.腰部"],["05","5.鎖骨周囲"],["06","6.肩・上腕近位"],["07","7.上腕"],
+  ["08","8.肘"],["09","9.前腕"],["10","10.手"],["11","11.胸部"],["12","12.腹部・側腹部"],["13","13.股関節前方・鼠径部"],
+  ["14","14.股関節後側方・臀部・大腿近位"],["15","15.大腿"],["16","16.膝"],["17","17.下腿"],["18","18.下腿遠位〜足関節"],["19","19.足関節より遠位"],["99","99.その他"]
+];
+
+// 術式名から手術術式を推定
+function guessNcOpe(r){
+  var t = nfkc(opeName(r)), rev = /再置換|リビジョン|revision/i.test(t);
+  var spine = /脊椎|椎体|椎弓|TLIF|PLIF|PLF|LLIF|OLIF|XLIF|PPS|[CTL]\d{1,2}\s*\/\s*\d|頚椎|頸椎|胸椎|腰椎|ヘルニア摘出|MED|PED|UBE/i.test(t) && !/関節固定|腱固定/.test(t);
+  if (spine){
+    var inst = /固定|TLIF|PLIF|PLF|LLIF|OLIF|XLIF|PPS|スクリュー|インスト/i.test(t);
+    var ant = /前方|LLIF|OLIF|XLIF/i.test(t);
+    var lv = parseLevels(t), reg = "";
+    if (lv){ reg = regionOf(lv.top) + regionOf(Math.min(lv.bottom, 24)); }
+    else if (/頚|頸/.test(t)) reg = "CC"; else if (/胸/.test(t)) reg = "TT"; else reg = "LL";
+    var base = { CC:43, CT:47, TT:45, TL:49, LL:41, CL:47 }[reg] || 41;
+    var code = base + (ant ? 1 : 0) + (inst ? 10 : 0);
+    return String(code);
+  }
+  if (/リバース|RSA/i.test(t)) return "21";
+  if (/TSA|人工肩関節/i.test(t)) return "22";
+  if (/人工骨頭/.test(t) && /肩|上腕/.test(t)) return "23";
+  if (/人工骨頭|BHA/i.test(t)) return "14";
+  if (/単顆|UKA/i.test(t)) return rev ? "20" : "18";
+  if (/人工膝|TKA/i.test(t)) return rev ? "19" : "17";
+  if (/人工股|THA/i.test(t)) return rev ? "16" : "15";
+  if (/人工肘|TEA/i.test(t)) return rev ? "25" : "24";
+  if (/人工足|TAA/i.test(t)) return rev ? "27" : "26";
+  if (/腱板/.test(t)) return "64";
+  if (/半月板/.test(t)) return "61";
+  if (/靭帯|靱帯|ACL|PCL|MPFL/i.test(t)) return "62";
+  if (/関節唇|バンカート|Bankart/i.test(t)) return "65";
+  if (/授動/.test(t)) return "66";
+  if (/滑膜切除/.test(t)) return "63";
+  if (/手根管/.test(t)) return "81";
+  if (/肘部管/.test(t)) return "82";
+  if (/アキレス/.test(t)) return "83";
+  if (/肩鎖/.test(t)) return "85";
+  if (/腱縫合/.test(t)) return "84";
+  if (/HTO|高位脛骨/i.test(t)) return "34";
+  if (/寛骨臼|骨盤骨切|RAO|CPO/i.test(t)) return "36";
+  if (/偽関節/.test(t)) return "11";
+  if (/Gamma|ガンマ|PFNA|ITST/i.test(t)) return "01";
+  if (/CCHS|ハンソン/i.test(t)) return "02";
+  if (/CHS|DHS/i.test(t)) return "03";
+  if (/関節固定/.test(t)) return "28";
+  if (/関節形成/.test(t)) return "29";
+  if (/軟部腫瘍|ガングリオン/.test(t)) return "76";
+  if (/骨腫瘍/.test(t)) return "71";
+  if (/観血的整復|骨接合|ORIF/i.test(t)){
+    if (/髄内釘/.test(t)) return "09";
+    if (/プレート/.test(t)) return "08";
+    if (/スクリュー|ワイヤー|鋼線/.test(t)) return "10";
+  }
+  return "";
+}
+function guessNcSide(r, code){
+  var t = nfkc(opeName(r));
+  var g = ncOpeGroup(code);
+  if (g === "05" || g === "06") return /右|左/.test(t) ? "" : "03";
+  if (/両/.test(t)) return "04";
+  var R = /右/.test(t), L = /左/.test(t);
+  if (R && L) return "04";
+  if (R) return "02";
+  if (L) return "01";
+  return "";
+}
+function guessNcSite(r, code){
+  var t = nfkc(opeName(r));
+  var byCode = { "14":"13","15":"13","16":"13","17":"16","18":"16","19":"16","20":"16","21":"06","22":"06","23":"06","24":"08","25":"08","26":"18","27":"18",
+                 "64":"06","65":"06","66":"06","81":"10","82":"08","83":"18","85":"05","34":"16","36":"13","01":"14","02":"14","03":"14" };
+  if (byCode[code]) return byCode[code];
+  var g = ncOpeGroup(code);
+  if (g === "05" || g === "06"){
+    var n = parseInt(code, 10) % 10;   // 1,3,5,7,9=後方 2,4,6,8,0=前方
+    if (/頚|頸/.test(t) || code === "43" || code === "53") return "02";
+    if (code === "44" || code === "54") return "01";
+    if (code === "45" || code === "55") return "03";
+    return "04";
+  }
+  if (/肩/.test(t)) return "06";
+  if (/肘/.test(t)) return "08";
+  if (/手関節|手根|指|手/.test(t)) return "10";
+  if (/膝/.test(t)) return "16";
+  if (/足関節|アキレス/.test(t)) return "18";
+  if (/足|趾|踵|外反母趾/.test(t)) return "19";
+  if (/鎖骨/.test(t)) return "05";
+  if (/前腕|橈骨|尺骨/.test(t)) return "09";
+  if (/上腕/.test(t)) return "07";
+  if (/大腿/.test(t)) return "15";
+  if (/下腿|脛骨/.test(t)) return "17";
+  if (/股/.test(t)) return "13";
+  return "";
+}
+
+// 手術2（部位ごと）のシートを作る
+function ncSiteSheet(n){
+  var p = "S" + n + "_";
+  var opts = NC_OPE.map(function(o){ return o[0] ? [o[0], o[1]] : ["", o[1]]; });
+  return {
+    code:"OP2", site:n, title:"手術2（部位" + n + "）", qr:true,
+    fixed:"創洗浄：（希釈）イソジン洗浄併用／抗菌縫合糸：使用した／局所抗菌薬：なし",
+    fields:[
+      { id:p+"R3222", qn:"R3222", label:"手術術式", kind:"radio", opts:opts, group:true },
+      { id:p+"R3230", qn:"R3230", label:"主な手術部位（左右）", kind:"radio", opts:[["01","左"],["02","右"],["03","正中"],["04","両側"]] },
+      { id:p+"R3231", qn:"R3231", label:"主な手術部位", kind:"radio", opts:NC_SITE },
+      { id:p+"R3202", qn:"R3202", label:"執刀前、最終術野消毒", kind:"radio", opts:[["01","イソジンアルコール"],["02","イソジン"],["03","クロルヘキシジンアルコール"],["04","オラネジン"],["05","その他"]],
+        note:"アレルギーの人はイソジン" },
+      { id:p+"R3205", qn:"R3205", label:"ヨード含有ドレープ", kind:"radio", opts:[["01","使用した"],["02","使用せず"]], note:"人工肩のみ使用" },
+      { id:p+"R3219", qn:"R3219", label:"手術終了時体温", kind:"radio", opts:[["01","≧36℃"],["02","＜36℃"],["03","未測定"]], note:"麻酔記録" },
+      { id:p+"R3221", qn:"R3221", label:"手術回数", kind:"radio", opts:[["01","初回手術"],["02","再手術（SSI既往あり）"],["03","再手術（SSI既往なし）"]] }
+    ]
+  };
+}
+var NC_SITE_SHEETS = [ncSiteSheet(1), ncSiteSheet(2), ncSiteSheet(3)];
+
+var NC_FIXED_SHEETS = {
+  NEW:{
+    code:"NEW", title:"新規登録", qr:true,
+    fields:[
+      { id:"OPD", label:"手術日", kind:"date", ids:["N0014","N0015","N0016"] },
+      { id:"AGE", qn:"N0010", label:"手術時年齢", kind:"num", unit:"歳" },
+      { id:"BMON", qn:"N0075", label:"誕生月", kind:"num", unit:"月" },
+      { id:"SEX", qn:"R0011", label:"性別", kind:"radio", opts:OPT_SEX },
+      { id:"PID", label:"加工ID", kind:"pid", ids:["T0072","T0073"], note:"再入力にも同じ値／後日変更できません" }
+    ]
+  },
+  JOIN:{
+    code:"JOIN", title:"参加", qr:false,
+    fields:[ { id:"J1", label:"参加確認", kind:"hand", text:"登録する／選択基準：満たす／除外基準：満たさない（サイトが自動で選択。ヘルパーの「固定値だけ入力」でも可）" } ]
+  },
+  COM:{
+    code:"COM", title:"基本情報", qr:true,
+    fields:[
+      { id:"HT", qn:"N0021", label:"身長", kind:"num", unit:"cm" },
+      { id:"WT", qn:"N0022", label:"体重", kind:"num", unit:"kg" },
+      { id:"R0026", label:"術式大分類", kind:"radio", opts:[["01","ORIF（脊椎以外）"],["02","人工関節・人工骨頭"],["03","関節固定／形成／切除"],["04","骨切り、変形矯正"],
+          ["05","脊椎（インストなし）"],["06","脊椎（インストあり）"],["07","関節鏡、内視鏡"],["08","骨腫瘍切除"],["09","軟部腫瘍"],["10","その他"]],
+        note:"手術2（部位1）の術式から自動" },
+      { id:"R0029", label:"ASA", kind:"radio", opts:[["01","1"],["02","2"],["03","3"],["04","4または5または6"]] },
+      { id:"OPMIN", qn:"N0030", label:"手術時間", kind:"num", unit:"分", note:"執刀開始〜執刀終了" },
+      { id:"BLOOD", qn:"N0031", label:"出血量", kind:"num", unit:"g", note:"ごく少量は1" },
+      { id:"R0037", label:"緊急", kind:"radio", opts:[["01","待機手術"],["02","緊急手術"]] },
+      { id:"R0038", label:"初回／再手術", kind:"radio", opts:[["01","初回手術"],["02","予定二期手術の2回目"],["03","再手術／追加手術"]] },
+      { id:"N0039", label:"何回目", kind:"num", unit:"回目", sub:true, when:function(s){ return s.R0038 === "03"; } }
+    ]
+  },
+  OP1:{
+    code:"OP1", title:"手術1", qr:true,
+    fields:[
+      { id:"ACT_NONE", label:"合併症", kind:"action", btn:"全てなしにする", keys:["R3101","R3102","R3103"] },
+      { id:"R3101", label:"DM", kind:"radio", opts:[["01","なし"],["02","あり（インスリン注射）"],["03","あり（インスリン以外の投薬のみ）"],["04","あり（未投薬）"]] },
+      { id:"R3102", label:"透析", kind:"radio", opts:YN },
+      { id:"R3103", label:"関節リウマチ", kind:"radio", opts:YN },
+      { id:"G_ANE", label:"麻酔法（複数可）", kind:"checks", items:[["C3106","全身麻酔"],["C3107","脊髄くも膜下麻酔"],["C3108","硬膜外麻酔"],["C3111","その他"]] },
+      { id:"T3112", label:"その他の内容", kind:"textcode", sub:true, when:function(s){ return !!s.C3111; },
+        opts:[["K1","神経ブロック"],["K2","局所麻酔"],["K3","神経ブロック・局所麻酔"]] },
+      { id:"R3114", label:"現在の喫煙習慣", kind:"radio", opts:[["01","喫煙者でない"],["02","喫煙者である"]], note:"看護部の患者スクリーニング" },
+      { id:"G_ABX", label:"予防的抗菌薬（複数可）", kind:"checks", items:[["C3116","CEZ"],["C3117","CLDM"],["C3118","VCM"],["C3120","その他"]], note:"その他の薬剤名はサイトで手入力" },
+      { id:"R3122", label:"初回点滴のタイミング", kind:"radio", opts:[["01","適正である"],["02","適正でない"],["03","使用していない"]], note:"麻酔記録" },
+      { id:"R3123", label:"同日複数部位手術", kind:"radio", opts:[["01","なし"],["02","あり（2か所）"],["03","あり（3か所以上）"]], note:"部位の数だけ手術2のQRが出ます" },
+      { id:"R3126", label:"術前除菌", kind:"radio", opts:YN, note:"TSA・RSA・SCRはあり" }
+    ]
+  },
+  ND1:{
+    code:"ND1", title:"翌日以降1（全身）", qr:true,
+    fixed:"予防的抗菌薬の投与期間：割付に合わせてヘルパーが自動入力（術中のみ／術後24hr未満）。割付が「術中のみ」なら帰室後の投与回数も0回を自動入力",
+    fields:[
+      { id:"D_ALLOC", label:"割付（手術日から）", kind:"show",
+        show:function(P){ var a = ncAllocOf(P.st.OPD); return a ? a.name + "（" + a.from.replace(/-/g, "/") + "〜" + a.to.replace(/-/g, "/") + "）" : "スケジュール外の手術日です。サイトの割付を確認してください"; } },
+      { id:"R3152", label:"手術室での抗菌薬投与回数", kind:"radio", opts:[["01","1回"],["02","2回"],["03","3回"],["04","4回"],["05","5回以上"]], note:"麻酔記録で確認" },
+      { id:"R3153", label:"帰室後の抗菌薬投与回数", kind:"radio", opts:[["01","0回"],["02","1回"],["03","2回"],["04","3回"],["05","4回以上"]], note:"注射指示",
+        when:function(s){ var a = ncAllocOf(s.OPD); return !(a && a.code === "IO"); } },
+      { id:"R3154", label:"アナフィラキシー", kind:"radio", opts:[["01","なし"],["02","あり（抗菌薬）"],["03","あり（抗菌薬以外・不明）"]] },
+      { id:"R3155", label:"尿路カテーテル留置", kind:"radio", opts:[["01","なし"],["02","あり（術後＜24hr）"],["03","あり（術後≧24hr）"]], note:"CAUTIバンドル評価" }
+    ]
+  },
+  ND2:{
+    code:"ND2", title:"翌日以降2（部位ごと）", qr:false,
+    fields:[ { id:"J2", label:"術後ドレーン", kind:"hand", text:"なし（全例）。各部位のページでヘルパーの「固定値だけ入力」を押す" } ]
+  },
+  D30:{
+    code:"D30", title:"術後30日以降（SSI関連・合併症・転帰）", qr:false,
+    fields:[
+      { id:"D_30", label:"30日評価の目安", kind:"show",
+        show:function(P){ var d = addDays(P.st.OPD, 30); return d ? d.replace(/-/g, "/") + "（手術日の30日後）以降" : "手術日が入ると表示されます"; } },
+      hand("K1", "SSI有無（部位ごと）", "○なし　○あり　○確認できず →理由（　　　　　）"),
+      hand("K2", "SSI診断法", "○直接評価　○間接評価　○電話確認（○基準1　○基準2　○基準3　○基準4）"),
+      hand("K3", "合併症（30日以内）", "呼吸器感染 ○なし ○あり／尿路感染 ○なし ○あり／その他感染 ○なし ○あり／抗菌薬追加 ○なし ○あり"),
+      hand("K4", "再手術（30日以内）", "SSI治療目的 ○なし ○あり／それ以外 ○なし ○あり"),
+      hand("K5", "術後30日の転帰", "○自宅療養中（退院日　　/　　）○他院療養中　○入院中（継続／再入院）○死亡　○確認できず"),
+      hand("K6", "30日以内の再入院", "○なし　○あり（SSI評価・治療目的／SSIと関係なし）　○確認できず")
+    ]
+  }
+};
+function ncSiteCount(s){ return s.R3123 === "03" ? 3 : (s.R3123 === "02" ? 2 : 1); }
+
+var DEF_NC = {
+  key:"NC", reg:"NC", type:"X",
+  title:"NOCOTA-II study 入力用紙",
+  code1Head:"11-", code1Len:4,
+  candLabel:"候補（上條先生・領木先生の手術）だけ表示",
+  isCand:function(r){
+    var d = col(r, "執刀医").replace(/\s/g, "");
+    return NC_SURGEONS.some(function(n){ return d === n.replace(/\s/g, ""); });
+  },
+  idRule:ncIdRule,
+  sheets:function(P){
+    var F = NC_FIXED_SHEETS, n = ncSiteCount(P.st), list = [F.NEW, F.JOIN, F.COM, F.OP1];
+    for (var i=0;i<n;i++) list.push(NC_SITE_SHEETS[i]);
+    return list.concat([F.ND1, F.ND2, F.D30]);
+  },
+  init:function(P, put){
+    initCommon(P, put, ncIdRule);
+    var r = P.r;
+    put("R0037", col(r, "要求度") === "緊急" ? "02" : "01", "csv");
+    // 麻酔法
+    var an = nfkc(col(r, "麻酔方法")), g = false;
+    if (/全身麻酔/.test(an)){ P.st.C3106 = true; g = true; }
+    if (/脊椎麻酔|脊髄くも膜下/.test(an)){ P.st.C3107 = true; g = true; }
+    if (/硬膜外/.test(an)){ P.st.C3108 = true; g = true; }
+    var blk = /伝達麻酔|ブロック/.test(an), loc = /局所/.test(an);
+    if (blk || loc){ P.st.C3111 = true; g = true; put("T3112", blk && loc ? "K3" : (blk ? "K1" : "K2"), "csv"); }
+    if (g) P.src.G_ANE = "csv";
+    // 部位1
+    var code = guessNcOpe(r);
+    put("S1_R3222", code, "guess");
+    put("S1_R3230", guessNcSide(r, code), "guess");
+    put("S1_R3231", guessNcSite(r, code), "guess");
+    put("S1_R3202", "01", "init");
+    put("R3123", "01", "init");
+    put("R3154", "01", "init");
+    ncDerive(P, true);
+  },
+  onSet:function(P, id, v){ ncDerive(P, false); },
+  warnings:function(P){
+    var w = [], t = nfkc(opeName(P.r)), s = P.st;
+    if (!ncAllocOf(s.OPD)) w.push("手術日が割付スケジュールの範囲外です。サイトに表示される割付を確認してください");
+    if (/抜釘|抜去/.test(t)) w.push("術式に「抜釘・抜去」があります（除外基準4：抜釘手術）");
+    if (/創外固定|ピンニング/.test(t)) w.push("体外に露出する固定の可能性があります（除外基準1）");
+    if (/切断/.test(t)) w.push("切断手術の可能性があります（除外基準2）");
+    if (/生検/.test(t)) w.push("生検の可能性があります（除外基準3）");
+    if (/皮弁|植皮/.test(t)) w.push("皮弁・植皮の可能性があります（除外基準5）");
+    if (/BKP|椎体形成|Kyphoplasty|Vertebral/i.test(t)) w.push("経皮的椎体形成術の可能性があります（除外基準7）");
+    var lv = parseLevels(t);
+    if (lv && lv.n >= 4 && /固定|TLIF|PLIF|LLIF|OLIF|XLIF|PPS/i.test(t)) w.push("4椎間以上の脊椎固定の可能性があります（除外基準8）");
+    if (!s.S1_R3222) w.push("手術術式を術式名から推定できませんでした");
+    commonWarnings(P, w);
+    return w;
+  }
+};
+// 手術2（部位1）の術式から、大分類・ドレープ・術前除菌を連動させる（人が選んだものは触らない）
+function ncDerive(P, first){
+  var s = P.st, code = s.S1_R3222 || "";
+  function auto(id, v){
+    if (P.src[id] === "user") return;
+    if (v){ s[id] = v; P.src[id] = "guess"; } else if (!first){ delete s[id]; delete P.src[id]; }
+  }
+  auto("R0026", ncOpeGroup(code));
+  var shoulder = code === "21" || code === "22" || code === "23";
+  [1,2,3].forEach(function(n){
+    var c = s["S" + n + "_R3222"];
+    if (c) auto("S" + n + "_R3205", (c === "21" || c === "22" || c === "23") ? "01" : "02");
+  });
+  var scr = /SCR|上方関節包/i.test(nfkc(opeName(P.r)));
+  if (code || scr) auto("R3126", (code === "21" || code === "22" || scr) ? "02" : "01");
+}
+
+var DEFS = { "JD-A":DEF_JDA, "JD-S":DEF_JDS, "NC":DEF_NC };
+
+// ============================================================
+// 患者
+//   src: "csv"=CSVの値 / "guess"=推定 / "init"=いつもの値 / "user"=画面で選んだ
+// ============================================================
+var recs = [], picked = {}, patients = [], seq = 0;
+
+function makePatient(r, defKey){
+  var def = DEFS[defKey];
+  var P = { uid:++seq, defKey:defKey, r:r, st:{}, src:{} };
+  function put(id, v, src){ if (v !== "" && v != null && v !== undefined){ P.st[id] = v; P.src[id] = src; } }
+  def.init(P, put);
+  return P;
+}
+function setVal(P, id, v, src){
+  P.st[id] = v;
+  P.src[id] = src || "user";
+  var def = DEFS[P.defKey];
+  if (def.onSet) def.onSet(P, id, v);
+}
+function findField(P, id){
+  var sh = DEFS[P.defKey].sheets(P);
+  for (var i=0;i<sh.length;i++) for (var j=0;j<sh[i].fields.length;j++) if (sh[i].fields[j].id === id) return sh[i].fields[j];
   return null;
 }
 
 // ============================================================
-// 患者ごとの初期値（CSV・推定・初期値）
-//   src: "csv"=CSVの値 / "guess"=推定 / "init"=いつもの値 / "user"=画面で選んだ
-// ============================================================
-function makePatient(r, defKey){
-  var def = DEFS[defKey];
-  var P = { uid:++seq, defKey:defKey, r:r, st:{}, src:{} };
-  var birth = ymdParts(col(r, "生年月日"));
-  var op = ymdParts(col(r, "手術日"));
-  var adm = ymdParts(col(r, "入院日"));
-
-  function put(id, v, src){ if (v !== "" && v != null){ P.st[id] = v; P.src[id] = src; } }
-
-  // 新規登録
-  put("N0010", String(ageAt(birth, op)), "csv");
-  if (birth) put("N0075", String(birth[1]), "csv");
-  var sex = col(r, "性別");
-  put("R0011", sex === "男" ? "01" : (sex === "女" ? "02" : ""), "csv");
-  put("PID", procId(col(r, "患者番号")), "csv");
-
-  // 背景
-  put("D_ADM", isoOf(adm), "csv");
-  put("R0101", guessJointKind(r), "guess");
-  put("N0104", numOrBlank(col(r, "身長")), "csv");
-  put("N0105", numOrBlank(col(r, "体重")), "csv");
-  put("R0111", guessJointDisease(r), "guess");
-  if (/リウマチ/.test(diagName(r))) put("R0145", "02", "guess");
-
-  // 手術
-  put("D_OPE", isoOf(op), "csv");
-  put("N0233", String(minutesBetween(col(r, "執刀開始時刻"), col(r, "執刀終了時刻"))), "csv");
-  var bl = col(r, "出血量");
-  if (/^[0-9.]+$/.test(bl)) put("N0234", parseFloat(bl) === 0 ? "1" : bl, "csv");
-  var stored = parseFloat(col(r, "保存血液輸血量")) || 0;
-  var auto = parseFloat(col(r, "自己血液輸血量")) || 0;
-  if (stored > 0 || auto > 0){
-    put("R0236", "02", "guess");
-    if (stored > 0){ P.st.C0238 = true; P.src.G_TRF = "guess"; }
-  } else {
-    put("R0236", "01", "csv");
-  }
-
-  // 術後（いつもの値）
-  put("R0302", "02", "init");
-  put("R0303", "02", "init");
-  put("T0305", "K1", "init");
-
-  return P;
-}
-
-// 値を変えたときの連動
-function setVal(P, id, v, src){
-  P.st[id] = v;
-  P.src[id] = src || "user";
-  // 糖尿病ありを選んだら、初期値の「未測定（糖尿病ではないため）」を外す
-  if (id === "R0141" && v !== "01" && P.st.R0303 === "02" && P.src.R0303 === "init"){
-    delete P.st.R0303; delete P.st.T0305; delete P.src.R0303; delete P.src.T0305;
-  }
-}
-
-// ============================================================
-// 注意事項
-// ============================================================
-function warningsOf(P){
-  var r = P.r, s = P.st, w = [];
-  var ope = opeName(r), diag = diagName(r);
-  if (/再置換|抜去|入れ替え|入替|両/.test(ope)) w.push("術式に「再置換・抜去・両」などの語があります（非選択基準：再置換手術／複数部位）。対象かどうか確認してください");
-  if (/骨折/.test(diag)) w.push("病名に「骨折」があります（非選択基準：大腿骨近位部骨折）。対象かどうか確認してください");
-  if (s.N0010 !== undefined && s.N0010 !== "" && parseInt(s.N0010, 10) < 18) w.push("手術時年齢が18歳未満です（選択基準）");
-  if (!s.R0101) w.push("人工関節の種類を術式から推定できませんでした");
-  if (!s.N0233) w.push("CSVに執刀開始・終了時刻がないため、手術時間を計算できませんでした");
-  if (!s.N0104 || !s.N0105) w.push("CSVに身長または体重がありません");
-  if (!s.PID) w.push("患者番号から加工IDを作れませんでした");
-  if (s.R0141 && s.R0141 !== "01" && s.R0303 === "02" && s.T0305 === "K1") w.push("糖尿病ありなのに、血糖が「未測定（糖尿病ではないため）」になっています");
-  if (s.R0236 === "02" && !(s.C0237 || s.C0238 || s.C0239 || s.C0240)) w.push("輸血ありですが、種類が選ばれていません");
-  if ((parseFloat(col(r, "自己血液輸血量")) || 0) > 0) w.push("CSVに自己血の輸血量があります。種類（術前貯血／術中回収／術後回収）を確認してください");
-  return w;
-}
-
-// ============================================================
 // QRの中身
-//   KQ1/登録先/分類/シート/AG年齢/SX性別/OP手術日/項目名-値/...
-//   英大文字・数字と / - . だけを使う（QRの英数字モードで小さく作れる）
+//   KQ1/登録先/分類/シート/AG年齢/SX性別/OP手術日/(ST部位)/項目名-値/...
+//   英大文字・数字と / - . だけ（QRの英数字モード）
 // ============================================================
 function qrString(P, sheet){
   var def = DEFS[P.defKey], s = P.st;
   var t = ["KQ1", def.reg, def.type, sheet.code];
-  if (s.N0010) t.push("AG" + s.N0010);
-  if (s.R0011) t.push("SX" + s.R0011.slice(1));
-  if (s.D_OPE) t.push("OP" + s.D_OPE.replace(/-/g, ""));
+  if (s.AGE) t.push("AG" + s.AGE);
+  if (s.SEX) t.push("SX" + s.SEX.slice(1));
+  if (s.OPD) t.push("OP" + s.OPD.replace(/-/g, ""));
+  if (sheet.site) t.push("ST" + sheet.site);
   var n = 0;
   sheet.fields.forEach(function(f){
     if (f.when && !f.when(s)) return;
+    var qn = f.qn || f.id;
     if (f.kind === "radio" || f.kind === "textcode"){
-      if (s[f.id]){ t.push(f.id + "-" + s[f.id]); n++; }
+      if (s[f.id]){ t.push(qn + "-" + s[f.id]); n++; }
     } else if (f.kind === "num"){
       var v = String(s[f.id] || "").replace(/[^0-9.]/g, "");
-      if (v){ t.push(f.id + "-" + v); n++; }
+      if (v){ t.push(qn + "-" + v); n++; }
     } else if (f.kind === "date"){
       if (s[f.id]){
         var p = s[f.id].split("-");
@@ -2878,8 +3371,6 @@ function qrString(P, sheet){
   });
   return { text:t.join("/").toUpperCase(), count:n };
 }
-
-// QRをSVGにする（どの大きさでも鮮明に印刷できるよう、拡大縮小できるSVGで作る）
 function qrSvg(text){
   var qr = qrcode(0, "M");
   qr.addData(text, "Alphanumeric");
@@ -2898,7 +3389,6 @@ function tagOf(P, id){
   var s = P.src[id];
   return TAGNAME[s] ? '<span class="tag ' + s + '">' + TAGNAME[s] + '</span>' : "";
 }
-
 function renderField(P, f){
   var s = P.st;
   if (f.when && !f.when(s)) return "";
@@ -2909,8 +3399,15 @@ function renderField(P, f){
   if (f.kind === "radio" || f.kind === "textcode"){
     need = !s[f.id];
     ct = f.opts.map(function(o){
+      if (!o[0]) return '<div class="note" style="margin-top:.6mm">' + esc(o[1]) + '</div>';
       return '<button type="button" class="opt' + (s[f.id] === o[0] ? " on" : "") + '"' + u + ' data-v="' + o[0] + '">' + esc(o[1]) + '</button>';
     }).join("");
+    // 選択肢が多い項目は、選んだ後は選んだものだけ表示（印刷を短くするため）
+    if (f.group && s[f.id]){
+      var hit = f.opts.filter(function(o){ return o[0] === s[f.id]; })[0];
+      ct = '<button type="button" class="opt on"' + u + ' data-v="' + s[f.id] + '">' + esc(hit ? hit[1] : s[f.id]) + '</button>' +
+           '<button type="button" class="act"' + u + ' data-v="' + s[f.id] + '">選び直す</button>';
+    }
     if (f.after) ct += f.after(s);
   } else if (f.kind === "checks"){
     ct = f.items.map(function(it){
@@ -2935,43 +3432,41 @@ function renderField(P, f){
   }
   if (f.note) ct += ' <span class="note">' + esc(f.note) + '</span>';
   if (need) cls += " need";
-  var tagId = f.kind === "checks" ? f.id : f.id;
-  return '<div class="' + cls + '"><div class="lb">' + esc(f.label) + tagOf(P, tagId) + '</div><div class="ct">' + ct + '</div></div>';
+  return '<div class="' + cls + '"><div class="lb">' + esc(f.label) + tagOf(P, f.id) + '</div><div class="ct">' + ct + '</div></div>';
 }
 
+function qrBox(P, sh){
+  var q = qrString(P, sh);
+  return qrSvg(q.text) + '<div class="cap">' + esc(sh.title) + '<br>' + q.count + '項目</div>';
+}
 function renderPaper(P){
-  var def = DEFS[P.defKey], r = P.r;
-  var w = warningsOf(P);
+  var def = DEFS[P.defKey], r = P.r, s = P.st;
+  var w = def.warnings(P);
   var html = '<article class="paper" id="paper' + P.uid + '">';
   html += '<div class="ptop"><div>' +
             '<h3>' + esc(def.title) + '</h3>' +
-            '<div class="meta">術式：' + esc(opeName(r)) + '<br>病名：' + esc(diagName(r)) + '</div>' +
-            '<div class="code1">コード1　' + esc(def.code1Hint) + '　<span></span>　<span class="note">登録後に控える</span></div>' +
+            '<div class="meta">術式：' + esc(opeName(r)) + '<br>病名：' + esc(diagName(r)) + '<br>執刀医：' + esc(col(r, "執刀医")) + '</div>' +
+            '<div class="code1">コード1　<b>' + esc(def.code1Head) + '</b> ' + new Array(def.code1Len + 1).join('<i class="box"></i>') + '　<span class="note">登録後に控える</span></div>' +
           '</div><div class="ids">' +
-            '手術日 <b>' + esc((P.st.D_OPE || "").replace(/-/g, "/")) + '</b><br>' +
-            'ID <b>' + esc(patientId6(col(r, "患者番号"))) + '</b>　加工ID <b>' + esc(P.st.PID || "") + '</b><br>' +
-            esc(P.st.N0010 || "") + '歳　' + (P.st.R0011 === "01" ? "男" : (P.st.R0011 === "02" ? "女" : "")) +
+            '手術日 <b>' + esc((s.OPD || "").replace(/-/g, "/")) + '</b><br>' +
+            'ID <b>' + esc(patientId6(col(r, "患者番号"))) + '</b>　加工ID <b>' + esc(s.PID || "") + '</b><br>' +
+            esc(s.AGE || "") + '歳　' + (s.SEX === "01" ? "男" : (s.SEX === "02" ? "女" : "")) +
             '<div class="screen-only"><button class="btn rm" data-rm="' + P.uid + '">この用紙を外す</button></div>' +
           '</div></div>';
   if (w.length) html += '<div class="warns">' + w.map(function(x){ return '<div>' + esc(x) + '</div>'; }).join("") + '</div>';
 
-  def.sheets.forEach(function(sh){
+  def.sheets(P).forEach(function(sh){
     html += '<section class="sec"><div class="main"><h4>' + esc(sh.title) + (sh.qr ? '<small>QRで入力</small>' : '<small>手書き</small>') + '</h4>';
     sh.fields.forEach(function(f){ html += renderField(P, f); });
     if (sh.fixed) html += '<div class="fixed">全例固定（ヘルパーが自動入力）：' + esc(sh.fixed) + '</div>';
     html += '</div>';
-    if (sh.qr){
-      var q = qrString(P, sh);
-      html += '<div class="qr" id="qr' + P.uid + sh.code + '">' + qrSvg(q.text) +
-              '<div class="cap">' + esc(sh.title) + 'シート<br>' + q.count + '項目</div></div>';
-    }
+    if (sh.qr) html += '<div class="qr" id="qr' + P.uid + sh.code + (sh.site || "") + '">' + qrBox(P, sh) + '</div>';
     html += '</section>';
   });
-  html += '<div class="note" style="margin-top:2mm">※ 印刷後に手書きで変えた内容はQRに入りません。J-DOSの画面で直接直してください。</div>';
+  html += '<div class="note" style="margin-top:2mm">※ 印刷後に手書きで変えた内容はQRに入りません。登録サイトの画面で直接直してください。</div>';
   html += '</article>';
   return html;
 }
-
 function renderAll(){
   var box = $("papers");
   if (!patients.length){
@@ -2989,15 +3484,11 @@ function rerender(P){
   tmp.innerHTML = renderPaper(P);
   el.replaceWith(tmp.firstChild);
 }
-// 文字入力中は再描画せず、QRと注意事項だけ更新する（カーソルが飛ばないように）
 function refreshQr(P){
-  var def = DEFS[P.defKey];
-  def.sheets.forEach(function(sh){
+  DEFS[P.defKey].sheets(P).forEach(function(sh){
     if (!sh.qr) return;
-    var box = $("qr" + P.uid + sh.code);
-    if (!box) return;
-    var q = qrString(P, sh);
-    box.innerHTML = qrSvg(q.text) + '<div class="cap">' + esc(sh.title) + 'シート<br>' + q.count + '項目</div>';
+    var box = $("qr" + P.uid + sh.code + (sh.site || ""));
+    if (box) box.innerHTML = qrBox(P, sh);
   });
 }
 function patientByUid(uid){
@@ -3006,7 +3497,6 @@ function patientByUid(uid){
   return null;
 }
 
-// 用紙上の操作（イベントは1か所でまとめて受ける）
 $("papers").addEventListener("click", function(e){
   var b = e.target.closest("button");
   if (!b) return;
@@ -3017,8 +3507,8 @@ $("papers").addEventListener("click", function(e){
   var P = patientByUid(b.dataset.uid);
   if (!P) return;
   if (b.dataset.act){
-    var f = findField(DEFS[P.defKey], b.dataset.act);
-    if (f && f.run) f.run(P);
+    var f = findField(P, b.dataset.act);
+    if (f && f.keys) f.keys.forEach(function(k){ setVal(P, k, "01", "user"); });
     rerender(P); return;
   }
   if (b.dataset.chk){
@@ -3028,7 +3518,7 @@ $("papers").addEventListener("click", function(e){
   }
   if (b.dataset.id){
     var id = b.dataset.id, v = b.dataset.v;
-    if (P.st[id] === v){ delete P.st[id]; delete P.src[id]; }   // もう一度押すと選択解除
+    if (P.st[id] === v){ delete P.st[id]; delete P.src[id]; var d = DEFS[P.defKey]; if (d.onSet) d.onSet(P, id, ""); }
     else setVal(P, id, v, "user");
     rerender(P);
   }
@@ -3039,11 +3529,10 @@ $("papers").addEventListener("input", function(e){
   var P = patientByUid(el.dataset.uid);
   if (!P) return;
   var v = el.value.trim();
-  if (v) { P.st[el.dataset.id] = v; P.src[el.dataset.id] = "user"; }
-  else   { delete P.st[el.dataset.id]; delete P.src[el.dataset.id]; }
+  if (v){ P.st[el.dataset.id] = v; P.src[el.dataset.id] = "user"; }
+  else { delete P.st[el.dataset.id]; delete P.src[el.dataset.id]; }
   refreshQr(P);
 });
-// 入力欄から離れたら全体を描き直す（注意事項・黄色表示の更新）
 $("papers").addEventListener("change", function(e){
   var el = e.target;
   if (!el.dataset || !el.dataset.uid) return;
@@ -3085,27 +3574,32 @@ function loadFile(file){
   };
   fr.readAsArrayBuffer(file);
 }
-
+function curDef(){ return DEFS[$("reg").value]; }
 function filtered(){
-  var from = $("fFrom").value, to = $("fTo").value, w = $("fWord").value.trim(), cand = $("fCand").checked;
+  var def = curDef();
+  var from = $("fFrom").value, to = $("fTo").value, w = $("fWord").value.trim(), cand = def.isCand && $("fCand").checked;
   return recs.filter(function(r){
     var d = isoOf(ymdParts(col(r, "手術日")));
     if (from && d < from) return false;
     if (to && d > to) return false;
-    if (cand && !isJointCandidate(r)) return false;
+    if (cand && !def.isCand(r)) return false;
     if (w){
-      var hay = patientId6(col(r, "患者番号")) + " " + opeName(r) + " " + diagName(r) + " " + toZenkakuKana(col(r, "氏名（カナ）"));
+      var hay = patientId6(col(r, "患者番号")) + " " + opeName(r) + " " + diagName(r) + " " + toZenkakuKana(col(r, "氏名（カナ）")) + " " + col(r, "執刀医");
       if (hay.indexOf(w) < 0) return false;
     }
     return true;
   });
 }
 function renderPick(){
+  var def = curDef();
+  $("fCandWrap").hidden = !def.isCand;
+  $("fCandLabel").textContent = def.candLabel;
+  $("candNote").textContent = def.isCand ? "左端に青線がある行は、術式から見た候補です。最終判断は人が行ってください。" : "対象の患者を選んでください。";
   var list = filtered();
   $("pickBody").innerHTML = list.map(function(r){
     var k = r.__key, on = !!picked[k];
     var age = ageAt(ymdParts(col(r, "生年月日")), ymdParts(col(r, "手術日")));
-    return '<tr class="' + (isJointCandidate(r) ? "cand " : "") + (on ? "sel" : "") + '" data-key="' + esc(k) + '">' +
+    return '<tr class="' + (def.isCand && def.isCand(r) ? "cand " : "") + (on ? "sel" : "") + '" data-key="' + esc(k) + '">' +
       '<td><input type="checkbox" data-key="' + esc(k) + '"' + (on ? " checked" : "") + ' aria-label="選択"></td>' +
       '<td>' + esc(col(r, "手術日").replace(/\./g, "/")) + '</td>' +
       '<td>' + esc(patientId6(col(r, "患者番号"))) + '</td>' +
@@ -3124,17 +3618,15 @@ $("pickBody").addEventListener("click", function(e){
   var tr = e.target.closest("tr");
   if (!tr) return;
   var k = tr.dataset.key;
-  if (e.target.tagName !== "INPUT"){
-    var cb = tr.querySelector("input"); cb.checked = !cb.checked;
-  }
+  if (e.target.tagName !== "INPUT"){ var cb = tr.querySelector("input"); cb.checked = !cb.checked; }
   if (tr.querySelector("input").checked) picked[k] = true; else delete picked[k];
   renderPick();
 });
 ["fFrom","fTo","fWord","fCand"].forEach(function(id){ $(id).addEventListener("input", renderPick); });
+$("reg").addEventListener("change", function(){ if (recs.length) renderPick(); });
 
 $("btnMake").addEventListener("click", function(){
-  var defKey = $("reg").value;
-  var have = {};
+  var defKey = $("reg").value, have = {};
   patients.forEach(function(p){ have[p.r.__key + "|" + p.defKey] = true; });
   recs.forEach(function(r){
     if (picked[r.__key] && !have[r.__key + "|" + defKey]) patients.push(makePatient(r, defKey));
@@ -3146,9 +3638,12 @@ $("btnMake").addEventListener("click", function(){
   if (first) first.scrollIntoView({ behavior:"smooth", block:"start" });
 });
 
+
 $("btnCsv").addEventListener("click", function(){ $("file").click(); });
 $("file").addEventListener("change", function(){ if (this.files[0]) loadFile(this.files[0]); this.value = ""; });
 var drop = $("drop");
+drop.addEventListener("click", function(){ $("file").click(); });
+drop.addEventListener("keydown", function(e){ if (e.key === "Enter" || e.key === " "){ e.preventDefault(); $("file").click(); } });
 ["dragenter","dragover"].forEach(function(t){ document.addEventListener(t, function(e){ e.preventDefault(); drop.classList.add("over"); }); });
 ["dragleave","drop"].forEach(function(t){ document.addEventListener(t, function(e){ e.preventDefault(); drop.classList.remove("over"); }); });
 document.addEventListener("drop", function(e){
@@ -3157,9 +3652,10 @@ document.addEventListener("drop", function(e){
 });
 $("btnPrint").addEventListener("click", function(){
   var miss = patients.filter(function(P){ return document.querySelector("#paper" + P.uid + " .row.need"); }).length;
-  if (miss && !confirm("黄色（未選択）の項目が残っている用紙が " + miss + " 枚あります。\n未選択の項目はQRに入らず、J-DOSで手入力になります。印刷しますか？")) return;
+  if (miss && !confirm("黄色（未選択）の項目が残っている用紙が " + miss + " 枚あります。\n未選択の項目はQRに入らず、登録サイトで手入力になります。印刷しますか？")) return;
   window.print();
 });
+renderAll();
 </script>
 </body>
 </html>
