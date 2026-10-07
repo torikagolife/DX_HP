@@ -1,5 +1,5 @@
 /**
- * 供給メールレーダー v0.2（本文サイズ超過対策）
+ * 供給メールレーダー v0.3（出典表記追加）
  * DSJP（DrugShortage.jp）医薬品供給情報メール → 採用薬マーク付き加工メールを送信
  *
  * 必要シート（このスクリプトをバインドするスプレッドシート内）
@@ -365,6 +365,8 @@ function renderHtml_(msg, p, st, c, mismatch, mode) {
   }
 
   h += '<div style="font-size:11px;color:#999;margin-top:16px;border-top:1px solid #eee;padding-top:6px;">' +
+    '出典：<a href="https://www.drugshortage.jp/" style="color:#999;">DSJP（DrugShortage.jp）</a>' +
+    '　／　照合：厚生労働省「薬価基準収載品目リスト」を加工して使用<br>' +
     '<a href="https://mail.google.com/mail/u/0/#all/' + msg.getId() + '">元メールを開く</a>　' +
     '生成：' + now + '（供給メールレーダー）</div></div>';
   return h;
@@ -412,6 +414,8 @@ function renderPlain_(p, st, mismatch) {
   p.items.filter(it => it.level > 0).forEach(it => {
     lines.push(LEVEL_INFO[it.level].mark + ' [' + it.status + '] ' + it.name + '（' + it.seller + '）');
   });
+  lines.push('', '出典：DSJP（DrugShortage.jp） https://www.drugshortage.jp/',
+    '照合：厚生労働省「薬価基準収載品目リスト」を加工して使用');
   return lines.join('\n');
 }
 
