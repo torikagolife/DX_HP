@@ -1,6 +1,6 @@
 function doGet() {
   return HtmlService.createHtmlOutputFromFile('index')
-    .setTitle('外来スケジュール登録システム')
+    .setTitle('ドクターコンタクト')
     .addMetaTag('viewport', 'width=device-width, initial-scale=1');
 }
 
@@ -198,7 +198,8 @@ function generateScheduleMessage(targetDateStr) {
       const detail = parts[1] || "";   
 
       // ★変更：正規化した名前で絵文字を特定
-      let emoji = "";
+      // ★追加：チーム未所属（または絵文字未設定）の先生は寂しいので 🩺 を既定にする
+      let emoji = "🩺";
       if (doctorTeamMap[nRawDoctor] && teamEmojiMap[doctorTeamMap[nRawDoctor]]) {
         emoji = teamEmojiMap[doctorTeamMap[nRawDoctor]];
       }
@@ -418,6 +419,26 @@ function generateScheduleMessage(targetDateStr) {
 }
 
 
+// ＝＝＝ ★追加：チーム名からグループトークのchannelIdを取得する共通関数 ＝＝＝
+//   専門・総合はグループが存在しないのでマップに載せない＝自動でボタン非表示になる
+//   「麻酔科」のように設定シート側の名前が長くても前方一致で拾う
+function getTeamGroupChannelId(teamName) {
+  if (!teamName) return null;
+  const groupPropKeyMap = {
+    "脊椎": "SEKITSUI_G",
+    "上肢": "JOUSHI_G",
+    "下肢": "KASHI_G",
+    "人工": "JINKOU_G",
+    "麻酔": "MASUI_G"
+  };
+  let propKey = groupPropKeyMap[teamName];
+  if (!propKey) {
+    const hitKey = Object.keys(groupPropKeyMap).find(k => teamName.indexOf(k) === 0);
+    propKey = hitKey ? groupPropKeyMap[hitKey] : null;
+  }
+  return propKey ? PropertiesService.getScriptProperties().getProperty(propKey) : null;
+}
+
 // ＝＝＝ 追加1：メイン機能 初回のチーム選択メッセージ生成関数 ＝＝＝
 function generateTeamListMessage() {
   const ss = SpreadsheetApp.openById(PropertiesService.getScriptProperties().getProperty("SPREADSHEET_ID"));
@@ -460,21 +481,51 @@ function generateTeamListMessage() {
       if (teamName && (showAddress === "〇" || showAddress === "○" || showAddress === "◯" || showAddress === "◎")) {
         
         let btnColor = pastelColors[colorIndex % pastelColors.length];
-        
-        boxContents.push({
-          type: "button",
-          style: "primary", // ★変更：背景色をつけるために primary に変更
-          color: btnColor,  // ★変更：パステルカラーを適用
-          height: "sm",
-          action: {
-            type: "message",
-            label: `${emoji} ${teamName}チーム`,
-            text: `${teamName}チームの連絡先`,
-            postback: `REQ_TEAM:${teamName}`
-          },
-          margin: "sm"
-        });
-        
+
+        // ★変更：チームボタン＋右側にグループLINEボタンを横並びにする
+        let teamRow = {
+          type: "box",
+          layout: "horizontal",
+          spacing: "sm",
+          margin: "sm",
+          contents: [
+            {
+              type: "button",
+              style: "primary", // ★変更：背景色をつけるために primary に変更
+              color: btnColor,  // ★変更：パステルカラーを適用
+              height: "sm",
+              flex: 5,
+              action: {
+                type: "message",
+                label: `${emoji} ${teamName}チーム`,
+                text: `${teamName}チームの連絡先`,
+                postback: `REQ_TEAM:${teamName}`
+              }
+            }
+          ]
+        };
+
+        const teamGroupId = getTeamGroupChannelId(teamName);
+        if (teamGroupId) {
+          teamRow.contents.push({
+            type: "button",
+            style: "primary",
+            color: "#06C755",
+            height: "sm",
+            flex: 1,
+            action: {
+              type: "uri",
+              label: "💬",
+              uri: `https://line.worksmobile.com/message/send?version=28&channelId=${teamGroupId}`
+            }
+          });
+        } else {
+          // グループが無いチーム（総合・専門など）は幅を揃えるための空白
+          teamRow.contents.push({ type: "text", text: " ", flex: 1 });
+        }
+
+        boxContents.push(teamRow);
+
         colorIndex++;
       }
     }
@@ -483,6 +534,62 @@ function generateTeamListMessage() {
   // 万が一対象チームが0個だった場合のフォールバック
   if (boxContents.length === 3) {
      boxContents.push({ type: "text", text: "設定シートにアドレス表示対象のチームがありません。", wrap: true });
+  }
+
+  // ★追加：当直医への連絡ボタン（LINE／電話）
+  const touchokuLineId = PropertiesService.getScriptProperties().getProperty("TOUCHOKU_LINE");
+  const touchokuTell = PropertiesService.getScriptProperties().getProperty("TOUCHOKU_TELL");
+
+  if (touchokuLineId || touchokuTell) {
+    boxContents.push({ type: "separator", margin: "lg" });
+    boxContents.push({
+      type: "text",
+      text: "🌙 当直医",
+      weight: "bold",
+      size: "md",
+      color: "#2c3e50",
+      margin: "md"
+    });
+
+    let touchokuRow = {
+      type: "box",
+      layout: "horizontal",
+      spacing: "sm",
+      margin: "sm",
+      contents: []
+    };
+
+    if (touchokuLineId) {
+      touchokuRow.contents.push({
+        type: "button",
+        style: "primary",
+        color: "#06C755",
+        height: "sm",
+        flex: 1,
+        action: {
+          type: "uri",
+          label: "💬 LINE",
+          uri: `https://line.worksmobile.com/message/send?version=28&emailList=${touchokuLineId}`
+        }
+      });
+    }
+
+    if (touchokuTell) {
+      touchokuRow.contents.push({
+        type: "button",
+        style: "primary",
+        color: "#e84393",
+        height: "sm",
+        flex: 1,
+        action: {
+          type: "uri",
+          label: "📞 電話",
+          uri: `tel:${touchokuTell}`
+        }
+      });
+    }
+
+    boxContents.push(touchokuRow);
   }
 
   return {
@@ -520,19 +627,8 @@ function generateAddressBookMessage(targetTeam) {
     }
   }
 
-  // ★追加：チーム名 → グループトーク用スクリプトプロパティキーのマップ
-  //         専門・総合はグループが存在しないのでここに載せない＝自動でボタン非表示になる
-  const groupPropKeyMap = {
-    "脊椎": "SEKITSUI_G",
-    "上肢": "JOUSHI_G",
-    "下肢": "KASHI_G",
-    "人工": "JINKOU_G",
-    "麻酔": "MASUI_G"
-  };
-  const groupPropKey = groupPropKeyMap[targetTeam];
-  const groupChannelId = groupPropKey
-    ? PropertiesService.getScriptProperties().getProperty(groupPropKey)
-    : null;
+  // ★変更：チーム名 → グループトークIDの取得は共通関数 getTeamGroupChannelId に集約
+  const groupChannelId = getTeamGroupChannelId(targetTeam);
 
   // 2. 当日のステータスマップを作成（時間は問わず、一日のスケジュールを格納）
   let currentJST = new Date();
